@@ -157,6 +157,14 @@ class MemoryDocuments {
                         throw conflict()
                     }
                     return () => undefined
+                case 'put':
+                    return () =>
+                        p.set(item.key, {
+                            revision: item.newRevision as string,
+                            json: JSON.stringify(item.document),
+                        })
+                case 'clear':
+                    return () => p.delete(item.key)
             }
         })
         for (const apply of applies) {

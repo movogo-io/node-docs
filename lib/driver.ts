@@ -38,6 +38,20 @@ export type TransactionItem =
           key: string
           revision: Revision
       }
+    | {
+          op: 'put'
+          table: string
+          partition: string
+          key: string
+          document: StoredDocument
+          newRevision: Revision
+      }
+    | {
+          op: 'clear'
+          table: string
+          partition: string
+          key: string
+      }
 
 export type Connection = {
     close: () => Promise<void>

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import type { TransactionItem } from './driver.js'
 
-const maxItems = 100
+export const maxTransactionItems = 100
 
 export class TransactionBuffer {
     readonly #items: TransactionItem[] = []
@@ -47,8 +47,10 @@ export class TransactionBuffer {
                 `Transaction already contains an operation on '${item.key}' in partition '${item.partition}' of table '${item.table}'.`,
             )
         }
-        if (this.#items.length === maxItems) {
-            throw new Error(`Transaction cannot contain more than ${String(maxItems)} operations.`)
+        if (this.#items.length === maxTransactionItems) {
+            throw new Error(
+                `Transaction cannot contain more than ${String(maxTransactionItems)} operations.`,
+            )
         }
         this.#touched.add(id)
         this.#items.push(item)

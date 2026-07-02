@@ -1,6 +1,6 @@
 {
   "name": "@riddance/docs",
-  "version": "0.0.5",
+  "version": "0.0.4",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -13,6 +13,7 @@
   ],
   "exports": {
     ".": "./partitioned.js",
+    "./indexed": "./indexed.js",
     "./schema": "./schema.js",
     "./driver": "./driver.js",
     "./test/memory": "./memory.js",
@@ -24,6 +25,7 @@
   },
   "mock": "test/mock",
   "scripts": {
+    "prepare": "tsc",
     "start": "riddance-watch",
     "prepack": "riddance-build",
     "prepublishOnly": "riddance-prepublish",

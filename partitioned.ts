@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import { setTimeout } from 'node:timers/promises'
 import { getDriver, type Connection } from './lib/driver.js'
+import {
+    addWithIndexes,
+    deleteWithIndexes,
+    expandIndexOperations,
+    indexEntriesOf,
+    updateWithIndexes,
+} from './lib/indexes.js'
 import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
@@ -31,7 +38,7 @@ type DocumentOfFixedKey<
     K extends KeyOf<Schema, Table>,
 > = Schema[Table][PartitionKeyOf<Schema, Table>][K]
 
-type Tables<Schema> = string extends TableNamesOf<Schema> ? never : NamedTables<Schema>
+export type Tables<Schema> = string extends TableNamesOf<Schema> ? never : NamedTables<Schema>
 
 type NamedTables<Schema> = {
     readonly [P in TableNamesOf<Schema>]: Documents<Schema, P>
@@ -243,7 +250,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
         withKey: (key: string) => ({
             async add(partition: string, document: unknown) {
                 const c = await db[connectionEntry]
-                return c.add(table, partition, key, document)
+                return await addWithIndexes(c, table, partition, key, document)
             },
             async get(partition: string) {
                 const c = await db[connectionEntry]
@@ -256,7 +263,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             },
             async update(partition: string, revision: Revision, document: StoredDocument) {
                 const c = await db[connectionEntry]
-                return await c.update(table, partition, key, revision, document)
+                return await updateWithIndexes(c, table, partition, key, revision, document)
             },
             async updateRow(row: {
                 partition: string
@@ -264,7 +271,14 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 document: StoredDocument
             }) {
                 const c = await db[connectionEntry]
-                return await c.update(table, row.partition, key, row.revision, row.document)
+                return await updateWithIndexes(
+                    c,
+                    table,
+                    row.partition,
+                    key,
+                    row.revision,
+                    row.document,
+                )
             },
             async getOrAdd(partition: string, document: unknown, options?: RetryOptions) {
                 const c = await db[connectionEntry]
@@ -335,7 +349,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             },
             async delete(partition: string, revision: Revision) {
                 const c = await db[connectionEntry]
-                await c.delete(table, partition, key, revision)
+                await deleteWithIndexes(c, table, partition, key, revision)
             },
         }),
         partition: (partition: string) => new Partition(db[connectionEntry], table, partition),
@@ -365,7 +379,7 @@ class Partition {
 
     async add(key: string, document: StoredDocument) {
         const c = await this.#connection
-        return c.add(this.#table, this.#partition, key, document)
+        return await addWithIndexes(c, this.#table, this.#partition, key, document)
     }
     async get(key: string) {
         const c = await this.#connection
@@ -389,11 +403,18 @@ class Partition {
     }
     async update(key: string, revision: Revision, document: StoredDocument) {
         const c = await this.#connection
-        return c.update(this.#table, this.#partition, key, revision, document)
+        return await updateWithIndexes(c, this.#table, this.#partition, key, revision, document)
     }
     async updateRow(row: { key: string; revision: Revision; document: StoredDocument }) {
         const c = await this.#connection
-        return c.update(this.#table, this.#partition, row.key, row.revision, row.document)
+        return await updateWithIndexes(
+            c,
+            this.#table,
+            this.#partition,
+            row.key,
+            row.revision,
+            row.document,
+        )
     }
     async getOrAdd(key: string, document: unknown, options?: RetryOptions) {
         const c = await this.#connection
@@ -470,7 +491,7 @@ class Partition {
     }
     async delete(key: string, revision: Revision) {
         const c = await this.#connection
-        await c.delete(this.#table, this.#partition, key, revision)
+        await deleteWithIndexes(c, this.#table, this.#partition, key, revision)
     }
 }
 
@@ -559,7 +580,7 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
                 transactionTablesProxy,
             ) as unknown as TransactionTables<Schema>
             const result = await fn(tx)
-            const items = buffer.seal()
+            const items = await expandIndexOperations(c, buffer.seal())
             if (items.length !== 0) {
                 await c.transact(items)
             }
@@ -734,7 +755,7 @@ async function getOrAdd(
             return await c.get(table, partition, key)
         } catch (e) {
             if (isNotFound(e)) {
-                const revision = await c.add(table, partition, key, document)
+                const revision = await addWithIndexes(c, table, partition, key, document)
                 return { partition, key, revision, document }
             }
             throw e
@@ -756,7 +777,7 @@ async function getOrAddComputed<T>(
         } catch (e) {
             if (isNotFound(e)) {
                 const document = await callback()
-                const revision = await c.add(table, partition, key, document)
+                const revision = await addWithIndexes(c, table, partition, key, document)
                 return { partition, key, revision, document }
             }
             throw e
@@ -776,12 +797,21 @@ async function addOrUpdate<T>(
     return await retryConflict(async () => {
         try {
             const row = await c.get(table, partition, key)
+            const oldEntries = indexEntriesOf(table, partition, key, row.document)
             update(row.document as T)
-            const revision = await c.update(table, partition, key, row.revision, row.document)
+            const revision = await updateWithIndexes(
+                c,
+                table,
+                partition,
+                key,
+                row.revision,
+                row.document,
+                oldEntries,
+            )
             return { action: 'update', partition, key, revision, document: row.document }
         } catch (e) {
             if (isNotFound(e)) {
-                const revision = await c.add(table, partition, key, document)
+                const revision = await addWithIndexes(c, table, partition, key, document)
                 return { action: 'add', partition, key, revision, document }
             }
             throw e
@@ -801,13 +831,22 @@ async function addOrUpdateComputed<T>(
     return await retryConflict(async () => {
         try {
             const row = await c.get(table, partition, key)
+            const oldEntries = indexEntriesOf(table, partition, key, row.document)
             update(row.document as T)
-            const revision = await c.update(table, partition, key, row.revision, row.document)
+            const revision = await updateWithIndexes(
+                c,
+                table,
+                partition,
+                key,
+                row.revision,
+                row.document,
+                oldEntries,
+            )
             return { action: 'update', partition, key, revision, document: row.document }
         } catch (e) {
             if (isNotFound(e)) {
                 const document = await computed()
-                const revision = await c.add(table, partition, key, document)
+                const revision = await addWithIndexes(c, table, partition, key, document)
                 return { action: 'add', partition, key, revision, document }
             }
             throw e
@@ -832,13 +871,22 @@ async function converge<T>(
             if (target(row.document as T)) {
                 return row
             }
+            const oldEntries = indexEntriesOf(table, partition, key, row.document)
             update(row.document as T)
             assert.ok(target(row.document as T), 'Updated document does not meet target.')
-            const revision = await c.update(table, partition, key, row.revision, row.document)
+            const revision = await updateWithIndexes(
+                c,
+                table,
+                partition,
+                key,
+                row.revision,
+                row.document,
+                oldEntries,
+            )
             return { partition, key, revision, document: row.document }
         } catch (e) {
             if (isNotFound(e)) {
-                const revision = await c.add(table, partition, key, initial)
+                const revision = await addWithIndexes(c, table, partition, key, initial)
                 return { partition, key, revision, document: initial }
             }
             throw e
@@ -862,15 +910,24 @@ async function convergeComputed<T>(
             if (target(row.document as T)) {
                 return row
             }
+            const oldEntries = indexEntriesOf(table, partition, key, row.document)
             update(row.document as T)
             assert.ok(target(row.document as T), 'Updated document does not meet target.')
-            const revision = await c.update(table, partition, key, row.revision, row.document)
+            const revision = await updateWithIndexes(
+                c,
+                table,
+                partition,
+                key,
+                row.revision,
+                row.document,
+                oldEntries,
+            )
             return { partition, key, revision, document: row.document }
         } catch (e) {
             if (isNotFound(e)) {
                 const document = await initial()
                 assert.ok(target(document), 'Initial document does not meet target.')
-                const revision = await c.add(table, partition, key, document)
+                const revision = await addWithIndexes(c, table, partition, key, document)
                 return { partition, key, revision, document }
             }
             throw e

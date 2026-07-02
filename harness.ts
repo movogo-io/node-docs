@@ -359,6 +359,109 @@ export function harness(
         ])
         assert.strictEqual((await c.docs.get(table, partition, key)).revision, transactionRevision)
     })
+
+    it('puts documents unconditionally', async () => {
+        const { partition, key, document: first } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const firstRevision = anId()
+        await c.docs.transact([
+            { op: 'put', table, partition, key, document: first, newRevision: firstRevision },
+        ])
+        const added = await c.docs.get(table, partition, key)
+        assert.deepStrictEqual(added.document, first)
+        assert.strictEqual(added.revision, firstRevision)
+        const second = aDocument()
+        const secondRevision = anId()
+        await c.docs.transact([
+            { op: 'put', table, partition, key, document: second, newRevision: secondRevision },
+        ])
+        const replaced = await c.docs.get(table, partition, key)
+        assert.deepStrictEqual(replaced.document, second)
+        assert.strictEqual(replaced.revision, secondRevision)
+    })
+
+    it('clears present and absent documents', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        await c.docs.add(table, partition, key, added)
+        await c.docs.transact([
+            { op: 'clear', table, partition, key },
+            { op: 'clear', table, partition, key: anId() },
+        ])
+        await assert.rejects(c.docs.get(table, partition, key), isNotFound)
+    })
+
+    it('transacts nothing when puts and clears accompany a failing check', async () => {
+        const { partition, key, document: added } = aRow()
+        const putKey = anId()
+        const clearKey = anId()
+        await using c = await connect(driver, contextFactory)
+        const staleRevision = await c.docs.add(table, partition, key, added)
+        await c.docs.update(table, partition, key, staleRevision, aDocument())
+        await c.docs.add(table, partition, clearKey, aDocument())
+        const untouched = await c.docs.get(table, partition, clearKey)
+        await assert.rejects(
+            c.docs.transact([
+                {
+                    op: 'put',
+                    table,
+                    partition,
+                    key: putKey,
+                    document: aDocument(),
+                    newRevision: anId(),
+                },
+                { op: 'clear', table, partition, key: clearKey },
+                { op: 'check', table, partition, key, revision: staleRevision },
+            ]),
+            isConflict,
+        )
+        await assert.rejects(c.docs.get(table, partition, putKey), isNotFound)
+        assert.deepStrictEqual(await c.docs.get(table, partition, clearKey), untouched)
+    })
+
+    it('ranges keys containing the reserved separator', async () => {
+        const partition = anId()
+        const separator = '\u0000'
+        const doc1 = aDocument()
+        const doc2 = aDocument()
+        await using c = await connect(driver, contextFactory)
+        await c.docs.transact([
+            {
+                op: 'put',
+                table,
+                partition,
+                key: `b${separator}p1${separator}k1`,
+                document: doc1,
+                newRevision: anId(),
+            },
+            {
+                op: 'put',
+                table,
+                partition,
+                key: `b${separator}p2${separator}k2`,
+                document: doc2,
+                newRevision: anId(),
+            },
+            {
+                op: 'put',
+                table,
+                partition,
+                key: `ba${separator}p3${separator}k3`,
+                document: aDocument(),
+                newRevision: anId(),
+            },
+        ])
+        const prefixed = await Array.fromAsync(
+            c.docs.getPartition(table, partition, { withPrefix: `b${separator}` }),
+            r => r.document,
+        )
+        assert.deepStrictEqual(prefixed, [doc1, doc2])
+        const ranged = await Array.fromAsync(
+            c.docs.getPartition(table, partition, { after: 'b', before: `b${separator}p2` }),
+            r => r.document,
+        )
+        assert.deepStrictEqual(ranged, [doc1])
+    })
 }
 
 function anId(): string {

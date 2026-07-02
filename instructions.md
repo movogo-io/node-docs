@@ -198,3 +198,58 @@ The `tx` argument mirrors the `tables` surface with these rules:
 - Do not nest `withTransaction` calls: the inner transaction commits independently, and outer retries would re-run it.
 
 Transactional writes cost roughly twice as much as plain writes, so don't reach for `withTransaction` when writing a single document.
+
+## Secondary Indexes
+
+A table can declare additional access patterns as **secondary indexes**: alternative partition/sort-key pairs computed from each row. The store maintains index entries atomically with every write — replacing the pattern of hand-maintaining a separate lookup table and a transaction to keep the two in step.
+
+Declare indexes once, next to the schema in `./lib/schema.ts`, through the `docs` handle:
+
+```ts
+import { docs } from "@riddance/docs/indexed";
+
+const schema = docs<Schema>();
+
+// Find rentals by the unit they concern, regardless of supplier partition.
+export const rentalsByUnit = schema.index(
+    "Rentals",
+    "byUnit",
+    (r) => r.document.unitId, // index partition
+    (r) => r.key, // index sort key
+);
+
+// Sweep pending rentals by due date. Documents without a due date are omitted.
+export const rentalsDue = schema.index(
+    "Rentals",
+    "byStatus",
+    (r) => r.document.status, // 'pending' | 'active' — gives named accessors
+    (r) => r.document.due, // string | undefined — undefined ⇒ sparse
+);
+
+export function rentals(context: object, supplierId: string) {
+    return schema.tables(context).Rentals.partition(supplierId);
+}
+```
+
+Both extractors receive `{ partition, key, document }` of the row being written and return a string, or `undefined` to omit the row from that index (a **sparse** index — ideal for due/deadline sweeps). The value returned by `schema.index` is the typed, **read-only** accessor:
+
+```ts
+// Open-string index partitions:
+const row = await rentalsByUnit(context).partition(unitId).get(rentalId);
+// row: { key, revision, document, source: { partition, key } } | undefined
+
+// Literal-union index partitions become named accessors:
+for await (const r of rentalsDue(context).pending.getRange({ before: today })) {
+    // r.key is the due date; r.document is the full rental
+}
+```
+
+Rules and properties:
+
+- **Declare before the first write.** Writes consult the registered definitions, so `schema.index` calls must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
+- **Maintenance is atomic.** Every write to an indexed table (including the retry helpers and writes inside `withTransaction`) commits the document and its index entries in one transaction; a document can never be observed missing from, or stale in, an index. Reads are as consistent as the main table.
+- **Index rows carry the document and its revision.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`.
+- `get` returns `undefined` when nothing matches (several rows may share an index key; `get` returns the first in key order). `getRange` accepts the same ranges as `getRange` on a table.
+- **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
+- **Cost:** writes to an indexed table are transactional (roughly 2× write cost) and each index entry stores a copy of the document. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
+- **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
