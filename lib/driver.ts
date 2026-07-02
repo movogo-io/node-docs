@@ -6,6 +6,39 @@ export type Driver = {
     connect: (context: Context) => Promise<Connection>
 }
 
+export type TransactionItem =
+    | {
+          op: 'add'
+          table: string
+          partition: string
+          key: string
+          document: StoredDocument
+          newRevision: Revision
+      }
+    | {
+          op: 'update'
+          table: string
+          partition: string
+          key: string
+          revision: Revision
+          document: StoredDocument
+          newRevision: Revision
+      }
+    | {
+          op: 'delete'
+          table: string
+          partition: string
+          key: string
+          revision: Revision
+      }
+    | {
+          op: 'check'
+          table: string
+          partition: string
+          key: string
+          revision: Revision
+      }
+
 export type Connection = {
     close: () => Promise<void>
     add: (
@@ -33,6 +66,7 @@ export type Connection = {
         document: StoredDocument,
     ) => Promise<Revision>
     delete: (table: string, partition: string, key: string, revision: Revision) => Promise<void>
+    transact: (items: TransactionItem[]) => Promise<void>
 }
 
 let _driver: Driver = {

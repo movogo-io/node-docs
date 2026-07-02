@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { setTimeout } from 'node:timers/promises'
 import { getDriver, type Connection } from './lib/driver.js'
+import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
 type Context = {
@@ -217,20 +218,23 @@ function tablesBase(connection: Promise<Connection>) {
 
 type GenericProxyTarget = { [k: string | symbol]: unknown }
 
-const tablesProxy = {
-    get: (
-        target: GenericProxyTarget & ReturnType<typeof tablesBase>,
-        property: string | symbol,
-    ) => {
-        if (property in target) {
-            return target[property]
-        }
-        if (typeof property === 'symbol') {
-            return undefined
-        }
-        return new Proxy(tableBase(target, property), tableProxy)
-    },
+function facadeProxy<B extends object>(sub: (target: B, name: string) => unknown): ProxyHandler<B> {
+    return {
+        get: (target, property) => {
+            if (property in target) {
+                return (target as GenericProxyTarget)[property]
+            }
+            if (typeof property === 'symbol') {
+                return undefined
+            }
+            return sub(target, property)
+        },
+    }
 }
+
+const tablesProxy = facadeProxy((target: ReturnType<typeof tablesBase>, table) => {
+    return new Proxy(tableBase(target, table), tableProxy)
+})
 
 function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
     return {
@@ -344,17 +348,9 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
     }
 }
 
-const tableProxy = {
-    get: (target: GenericProxyTarget & ReturnType<typeof tableBase>, property: string | symbol) => {
-        if (property in target) {
-            return target[property]
-        }
-        if (typeof property === 'symbol') {
-            return undefined
-        }
-        return new Partition(target[connectionEntry], target[tableNameEntry], property)
-    },
-}
+const tableProxy = facadeProxy((target: ReturnType<typeof tableBase>, partition) => {
+    return new Partition(target[connectionEntry], target[tableNameEntry], partition)
+})
 
 class Partition {
     readonly #connection
@@ -478,7 +474,251 @@ class Partition {
     }
 }
 
-type RetryOptions = { retries: number; delay: number; signal: AbortSignal }
+export type TransactionTables<Schema> =
+    string extends TableNamesOf<Schema> ? never : NamedTransactionTables<Schema>
+
+type NamedTransactionTables<Schema> = {
+    readonly [P in TableNamesOf<Schema>]: TransactionDocuments<Schema, P>
+}
+
+type TransactionDocuments<Schema, Table extends TableNamesOf<Schema>> =
+    string extends PartitionKeyOf<Schema, Table>
+        ? string extends KeyOf<Schema, Table>
+            ? TransactionPartitions<Schema, Table>
+            : TransactionPartitionsWithFixedKey<Schema, Table>
+        : NamedTransactionPartitions<Schema, Table>
+
+type TransactionPartitionsWithFixedKey<Schema, Table extends TableNamesOf<Schema>> = {
+    withKey<K extends KeyOf<Schema, Table>>(
+        key: K,
+    ): TransactionFixedKey<DocumentOfFixedKey<Schema, Table, K>>
+    getPartitions(): AsyncIterable<string>
+}
+
+type NamedTransactionPartitions<Schema, Table extends TableNamesOf<Schema>> = {
+    readonly [P in PartitionKeyOf<Schema, Table>]: TransactionNamedPartition<
+        DocumentOfFixedPartition<Schema, Table, P>
+    >
+} & {
+    getPartitions(): AsyncIterable<string>
+}
+
+type TransactionPartitions<Schema, Table extends TableNamesOf<Schema>> = {
+    partition(partition: string): TransactionNamedPartition<DocumentOf<Schema, Table>>
+    getPartitions(): AsyncIterable<string>
+}
+
+type TransactionFixedKey<Document> = {
+    add: (partition: string, document: Document) => Promise<Revision>
+    get: (
+        partition: string,
+    ) => Promise<{ partition: string; revision: Revision; document: Document }>
+    getDocument: (partition: string) => Promise<Document>
+    update: (partition: string, revision: Revision, document: Document) => Promise<Revision>
+    updateRow: (row: {
+        partition: string
+        revision: Revision
+        document: Document
+    }) => Promise<Revision>
+    check: (partition: string, revision: Revision) => Promise<void>
+    delete: (partition: string, revision: Revision) => Promise<void>
+}
+
+type TransactionNamedPartition<Document> = {
+    add: (key: string, document: Document) => Promise<Revision>
+    get: (key: string) => Promise<{ key: string; revision: Revision; document: Document }>
+    getDocument: (key: string) => Promise<Document>
+    getAll: () => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+    getRange: (
+        range: KeyRange,
+    ) => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+    update: (key: string, revision: Revision, document: Document) => Promise<Revision>
+    updateRow: (row: { key: string; revision: Revision; document: Document }) => Promise<Revision>
+    check: (key: string, revision: Revision) => Promise<void>
+    delete: (key: string, revision: Revision) => Promise<void>
+}
+
+export async function withTransaction<Schema = GenericSchema, T = void>(
+    context: Context,
+    fn: (tx: TransactionTables<Schema>) => Promise<T>,
+    options?: RetryOptions,
+): Promise<T> {
+    const d = getDriver()
+    const connection = d.connect(context)
+    const closer = async () => {
+        const c = await connection
+        await c.close()
+    }
+    const registered = context.on?.('free', closer) ?? false
+    try {
+        const c = await connection
+        return await retryConflict(async () => {
+            const buffer = new TransactionBuffer()
+            const tx = new Proxy(
+                transactionTablesBase(connection, buffer),
+                transactionTablesProxy,
+            ) as unknown as TransactionTables<Schema>
+            const result = await fn(tx)
+            const items = buffer.seal()
+            if (items.length !== 0) {
+                await c.transact(items)
+            }
+            return result
+        }, options)
+    } finally {
+        if (!registered) {
+            await closer()
+        }
+    }
+}
+
+const bufferEntry = Symbol()
+
+function transactionTablesBase(connection: Promise<Connection>, buffer: TransactionBuffer) {
+    return {
+        [connectionEntry]: connection,
+        [bufferEntry]: buffer,
+    }
+}
+
+const transactionTablesProxy = facadeProxy(
+    (target: ReturnType<typeof transactionTablesBase>, table) => {
+        return new Proxy(transactionTableBase(target, table), transactionTableProxy)
+    },
+)
+
+function transactionTableBase(db: ReturnType<typeof transactionTablesBase>, table: string) {
+    return {
+        [connectionEntry]: db[connectionEntry],
+        [bufferEntry]: db[bufferEntry],
+        [tableNameEntry]: table,
+        withKey: (key: string) =>
+            new TransactionFixedKeySet(db[connectionEntry], db[bufferEntry], table, key),
+        partition: (partition: string) =>
+            new TransactionPartition(db[connectionEntry], db[bufferEntry], table, partition),
+        async *getPartitions() {
+            const c = await db[connectionEntry]
+            for await (const partition of c.getPartitions(table)) {
+                yield partition
+            }
+        },
+    }
+}
+
+const transactionTableProxy = facadeProxy(
+    (target: ReturnType<typeof transactionTableBase>, partition) => {
+        return new TransactionPartition(
+            target[connectionEntry],
+            target[bufferEntry],
+            target[tableNameEntry],
+            partition,
+        )
+    },
+)
+
+class TransactionPartition {
+    readonly #reads
+    readonly #buffer
+    readonly #table
+    readonly #partition
+
+    constructor(
+        connection: Promise<Connection>,
+        buffer: TransactionBuffer,
+        table: string,
+        partition: string,
+    ) {
+        this.#reads = new Partition(connection, table, partition)
+        this.#buffer = buffer
+        this.#table = table
+        this.#partition = partition
+    }
+
+    get(key: string) {
+        return this.#reads.get(key)
+    }
+    getDocument(key: string) {
+        return this.#reads.getDocument(key)
+    }
+    getAll() {
+        return this.#reads.getAll()
+    }
+    getRange(range: KeyRange) {
+        return this.#reads.getRange(range)
+    }
+    add(key: string, document: StoredDocument) {
+        return this.#buffer.add(this.#table, this.#partition, key, document)
+    }
+    update(key: string, revision: Revision, document: StoredDocument) {
+        return this.#buffer.update(this.#table, this.#partition, key, revision, document)
+    }
+    updateRow(row: { key: string; revision: Revision; document: StoredDocument }) {
+        return this.#buffer.update(
+            this.#table,
+            this.#partition,
+            row.key,
+            row.revision,
+            row.document,
+        )
+    }
+    check(key: string, revision: Revision) {
+        return this.#buffer.check(this.#table, this.#partition, key, revision)
+    }
+    delete(key: string, revision: Revision) {
+        return this.#buffer.delete(this.#table, this.#partition, key, revision)
+    }
+}
+
+class TransactionFixedKeySet {
+    readonly #connection
+    readonly #buffer
+    readonly #table
+    readonly #key
+
+    constructor(
+        connection: Promise<Connection>,
+        buffer: TransactionBuffer,
+        table: string,
+        key: string,
+    ) {
+        this.#connection = connection
+        this.#buffer = buffer
+        this.#table = table
+        this.#key = key
+    }
+
+    async get(partition: string) {
+        const c = await this.#connection
+        return await c.get(this.#table, partition, this.#key)
+    }
+    async getDocument(partition: string) {
+        const r = await this.get(partition)
+        return r.document
+    }
+    add(partition: string, document: StoredDocument) {
+        return this.#buffer.add(this.#table, partition, this.#key, document)
+    }
+    update(partition: string, revision: Revision, document: StoredDocument) {
+        return this.#buffer.update(this.#table, partition, this.#key, revision, document)
+    }
+    updateRow(row: { partition: string; revision: Revision; document: StoredDocument }) {
+        return this.#buffer.update(
+            this.#table,
+            row.partition,
+            this.#key,
+            row.revision,
+            row.document,
+        )
+    }
+    check(partition: string, revision: Revision) {
+        return this.#buffer.check(this.#table, partition, this.#key, revision)
+    }
+    delete(partition: string, revision: Revision) {
+        return this.#buffer.delete(this.#table, partition, this.#key, revision)
+    }
+}
+
+export type RetryOptions = { retries?: number; delay?: number; signal?: AbortSignal }
 type Row = { partition: string; key: string; revision: unknown; document: unknown }
 
 async function getOrAdd(

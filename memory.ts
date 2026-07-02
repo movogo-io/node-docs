@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
+import type { TransactionItem } from './lib/driver.js'
 import type { KeyRange } from './schema.js'
 
 const documentsEntry = Symbol()
@@ -122,6 +123,47 @@ class MemoryDocuments {
         p.delete(key)
     }
 
+    async transact(items: TransactionItem[]) {
+        await this.#throwIfClosed()
+        const applies = items.map(item => {
+            const p = this.#tables.get(item.table).get(item.partition)
+            const existing = p.get(item.key)
+            switch (item.op) {
+                case 'add':
+                    if (existing) {
+                        throw conflict()
+                    }
+                    return () =>
+                        p.set(item.key, {
+                            revision: item.newRevision as string,
+                            json: JSON.stringify(item.document),
+                        })
+                case 'update':
+                    if (!existing || existing.revision !== item.revision) {
+                        throw conflict()
+                    }
+                    return () =>
+                        p.set(item.key, {
+                            revision: item.newRevision as string,
+                            json: JSON.stringify(item.document),
+                        })
+                case 'delete':
+                    if (!existing || existing.revision !== item.revision) {
+                        throw conflict()
+                    }
+                    return () => p.delete(item.key)
+                case 'check':
+                    if (!existing || existing.revision !== item.revision) {
+                        throw conflict()
+                    }
+                    return () => undefined
+            }
+        })
+        for (const apply of applies) {
+            apply()
+        }
+    }
+
     #throwIfClosed() {
         if (this.#closed) {
             return Promise.reject(new Error('Connection has been closed.'))
@@ -176,6 +218,11 @@ class DelayedDocuments {
     async delete(table: string, partition: string, key: string, currentRevision: unknown) {
         await using _ = await delayed()
         await this.#inner.delete(table, partition, key, currentRevision)
+    }
+
+    async transact(items: TransactionItem[]) {
+        await using _ = await delayed()
+        await this.#inner.transact(items)
     }
 
     async close() {

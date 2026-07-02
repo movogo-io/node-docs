@@ -4,6 +4,7 @@ import type { Driver } from './lib/driver.js'
 import { isConflict, isNotFound } from './partitioned.js'
 
 const table = 'HarnessTestDocs'
+const otherTable = 'HarnessTestDocs2'
 
 export function harness(
     it: (message: string, runner: () => Promise<void>) => void,
@@ -152,6 +153,211 @@ export function harness(
         const { document, revision } = await c.docs.get(table, partition, key)
         assert.deepStrictEqual(added, document)
         assert.strictEqual(reAddedRevision, revision)
+    })
+
+    it('transacts adds across tables', async () => {
+        const { partition, key, document: added } = aRow()
+        const other = aDocument()
+        await using c = await connect(driver, contextFactory)
+        const revision = anId()
+        const otherRevision = anId()
+        await c.docs.transact([
+            { op: 'add', table, partition, key, document: added, newRevision: revision },
+            {
+                op: 'add',
+                table: otherTable,
+                partition,
+                key,
+                document: other,
+                newRevision: otherRevision,
+            },
+        ])
+        const row = await c.docs.get(table, partition, key)
+        assert.deepStrictEqual(row.document, added)
+        assert.strictEqual(row.revision, revision)
+        const otherRow = await c.docs.get(otherTable, partition, key)
+        assert.deepStrictEqual(otherRow.document, other)
+        assert.strictEqual(otherRow.revision, otherRevision)
+    })
+
+    it('transacts nothing when any add conflicts', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        await c.docs.add(table, partition, key, added)
+        const freshKey = anId()
+        await assert.rejects(
+            c.docs.transact([
+                { op: 'add', table, partition, key, document: added, newRevision: anId() },
+                {
+                    op: 'add',
+                    table,
+                    partition,
+                    key: freshKey,
+                    document: aDocument(),
+                    newRevision: anId(),
+                },
+            ]),
+            isConflict,
+        )
+        await assert.rejects(c.docs.get(table, partition, freshKey), isNotFound)
+    })
+
+    it('transacts nothing when any update conflicts', async () => {
+        const { partition, key, document: added } = aRow()
+        const secondKey = anId()
+        await using c = await connect(driver, contextFactory)
+        const staleRevision = await c.docs.add(table, partition, key, added)
+        const secondRevision = await c.docs.add(table, partition, secondKey, aDocument())
+        await c.docs.update(table, partition, key, staleRevision, aDocument())
+        const untouched = await c.docs.get(table, partition, secondKey)
+        await assert.rejects(
+            c.docs.transact([
+                {
+                    op: 'update',
+                    table,
+                    partition,
+                    key,
+                    revision: staleRevision,
+                    document: aDocument(),
+                    newRevision: anId(),
+                },
+                {
+                    op: 'update',
+                    table,
+                    partition,
+                    key: secondKey,
+                    revision: secondRevision,
+                    document: aDocument(),
+                    newRevision: anId(),
+                },
+            ]),
+            isConflict,
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, secondKey), untouched)
+    })
+
+    it('transacts mixed operations', async () => {
+        const { partition, key, document: added } = aRow()
+        const updateKey = anId()
+        const deleteKey = anId()
+        await using c = await connect(driver, contextFactory)
+        const updateRevision = await c.docs.add(table, partition, updateKey, aDocument())
+        const deleteRevision = await c.docs.add(otherTable, partition, deleteKey, aDocument())
+        const addedRevision = anId()
+        const updated = aDocument()
+        const updatedRevision = anId()
+        await c.docs.transact([
+            { op: 'add', table, partition, key, document: added, newRevision: addedRevision },
+            {
+                op: 'update',
+                table,
+                partition,
+                key: updateKey,
+                revision: updateRevision,
+                document: updated,
+                newRevision: updatedRevision,
+            },
+            {
+                op: 'delete',
+                table: otherTable,
+                partition,
+                key: deleteKey,
+                revision: deleteRevision,
+            },
+        ])
+        assert.deepStrictEqual((await c.docs.get(table, partition, key)).document, added)
+        const updatedRow = await c.docs.get(table, partition, updateKey)
+        assert.deepStrictEqual(updatedRow.document, updated)
+        assert.strictEqual(updatedRow.revision, updatedRevision)
+        await assert.rejects(c.docs.get(otherTable, partition, deleteKey), isNotFound)
+    })
+
+    it('checks unchanged document', async () => {
+        const { partition, key, document: added } = aRow()
+        const otherKey = anId()
+        await using c = await connect(driver, contextFactory)
+        const revision = await c.docs.add(table, partition, key, added)
+        await c.docs.transact([
+            { op: 'check', table, partition, key, revision },
+            {
+                op: 'add',
+                table,
+                partition,
+                key: otherKey,
+                document: aDocument(),
+                newRevision: anId(),
+            },
+        ])
+        const row = await c.docs.get(table, partition, key)
+        assert.strictEqual(row.revision, revision)
+        assert.deepStrictEqual(row.document, added)
+    })
+
+    it('rejects checking changed document', async () => {
+        const { partition, key, document: added } = aRow()
+        const otherKey = anId()
+        await using c = await connect(driver, contextFactory)
+        const staleRevision = await c.docs.add(table, partition, key, added)
+        await c.docs.update(table, partition, key, staleRevision, aDocument())
+        await assert.rejects(
+            c.docs.transact([
+                { op: 'check', table, partition, key, revision: staleRevision },
+                {
+                    op: 'add',
+                    table,
+                    partition,
+                    key: otherKey,
+                    document: aDocument(),
+                    newRevision: anId(),
+                },
+            ]),
+            isConflict,
+        )
+        await assert.rejects(c.docs.get(table, partition, otherKey), isNotFound)
+    })
+
+    it('rejects checking missing document', async () => {
+        await using c = await connect(driver, contextFactory)
+        await assert.rejects(
+            c.docs.transact([
+                { op: 'check', table, partition: anId(), key: anId(), revision: anId() },
+            ]),
+            isConflict,
+        )
+    })
+
+    it('gets JSON serialized from transaction', async () => {
+        const now = new Date()
+        const { partition, key, document: added } = aRow({ time: now })
+        await using c = await connect(driver, contextFactory)
+        await c.docs.transact([
+            { op: 'add', table, partition, key, document: added, newRevision: anId() },
+        ])
+        const { document } = await c.docs.get(table, partition, key)
+        assert.strictEqual(added.time.toISOString(), (document as { time: unknown }).time)
+    })
+
+    it('updates document added in a transaction', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const revision = anId()
+        await c.docs.transact([
+            { op: 'add', table, partition, key, document: added, newRevision: revision },
+        ])
+        const updatedRevision = await c.docs.update(table, partition, key, revision, aDocument())
+        const transactionRevision = anId()
+        await c.docs.transact([
+            {
+                op: 'update',
+                table,
+                partition,
+                key,
+                revision: updatedRevision,
+                document: aDocument(),
+                newRevision: transactionRevision,
+            },
+        ])
+        assert.strictEqual((await c.docs.get(table, partition, key)).revision, transactionRevision)
     })
 }
 

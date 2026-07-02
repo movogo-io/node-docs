@@ -171,3 +171,30 @@ documents.converge(
     },
 );
 ```
+
+## Transactions
+
+`withTransaction` applies writes to multiple documents — across partitions and tables — atomically: either all of them are applied, or none of them are. Use it when several tables express different access patterns over the same data (e.g. a main table plus a lookup table) and a partial write would corrupt the invariant between them.
+
+```ts
+import { withTransaction } from "@riddance/docs";
+
+await withTransaction<Schema>(context, async (tx) => {
+    const row = await tx.Outbox.partition(userId).get(messageId);
+    await tx.Outbox.partition(userId).delete(messageId, row.revision);
+    await tx.Sent.partition(userId).add(messageId, row.document);
+});
+```
+
+The `tx` argument mirrors the `tables` surface with these rules:
+
+- **Writes are buffered.** `add`, `update`, `updateRow`, `check`, and `delete` do not touch storage when called; they are queued and applied atomically when the callback resolves. Returned revisions are final and usable after the commit.
+- **Reads return committed state.** `get`, `getDocument`, `getAll`, `getRange`, and `getPartitions` pass through to storage — you cannot read your own buffered writes.
+- **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
+- **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — throw immediately and are not retried.
+- **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
+- The retry helpers (`getOrAdd`, `addOrUpdate`, `converge`) are not available inside a transaction; the whole-transaction retry replaces them.
+- If the callback throws, nothing is written.
+- Do not nest `withTransaction` calls: the inner transaction commits independently, and outer retries would re-run it.
+
+Transactional writes cost roughly twice as much as plain writes, so don't reach for `withTransaction` when writing a single document.
