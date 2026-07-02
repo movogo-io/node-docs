@@ -45,16 +45,20 @@ type Documents<Schema, Table extends TableNamesOf<Schema>> =
 
 type PartitionsWithFixedKey<Schema, Table extends TableNamesOf<Schema>> = {
     withKey<K extends KeyOf<Schema, Table>>(key: K): FixedKey<DocumentOfFixedKey<Schema, Table, K>>
+    getPartitions(): AsyncIterable<string>
 }
 
 type NamedPartitions<Schema, Table extends TableNamesOf<Schema>> = {
     readonly [P in PartitionKeyOf<Schema, Table>]: NamedPartition<
         DocumentOfFixedPartition<Schema, Table, P>
     >
+} & {
+    getPartitions(): AsyncIterable<string>
 }
 
 type Partitions<Schema, Table extends TableNamesOf<Schema>> = {
     partition(partition: string): NamedPartition<DocumentOf<Schema, Table>>
+    getPartitions(): AsyncIterable<string>
 }
 
 type FixedKey<Document> = {
@@ -331,6 +335,12 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             },
         }),
         partition: (partition: string) => new Partition(db[connectionEntry], table, partition),
+        async *getPartitions() {
+            const c = await db[connectionEntry]
+            for await (const partition of c.getPartitions(table)) {
+                yield partition
+            }
+        },
     }
 }
 

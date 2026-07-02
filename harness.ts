@@ -114,6 +114,27 @@ export function harness(
         )
     })
 
+    it('gets no partitions from unused table', async () => {
+        await using c = await connect(driver, contextFactory)
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartitions(anId())), [])
+    })
+
+    it('gets unique partitions', async () => {
+        await using c = await connect(driver, contextFactory)
+        const p1 = anId()
+        const p2 = anId()
+        const p3 = anId()
+        await c.docs.add(table, p1, 'a', aDocument({ key: 'a' }))
+        await c.docs.add(table, p1, 'b', aDocument({ key: 'b' }))
+        await c.docs.add(table, p2, 'a', aDocument({ key: 'a' }))
+        await c.docs.add(table, p3, 'a', aDocument({ key: 'a' }))
+        const partitions = await Array.fromAsync(c.docs.getPartitions(table))
+        assert.strictEqual(new Set(partitions).size, partitions.length)
+        for (const partition of [p1, p2, p3]) {
+            assert.ok(partitions.includes(partition), `Missing partition ${partition}.`)
+        }
+    })
+
     it('deletes added', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)

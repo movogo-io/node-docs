@@ -33,7 +33,9 @@ type Row = {
 }
 
 class MemoryDocuments {
-    readonly #tables = new MapWithDefault(() => new MapWithDefault(() => new Map<string, Row>()))
+    readonly #tables = new MapWithDefault(
+        () => new MapWithDefault<string, Map<string, Row>>(() => new Map<string, Row>()),
+    )
     #closed = false
 
     async add(table: string, partition: string, key: string, document: unknown) {
@@ -58,6 +60,16 @@ class MemoryDocuments {
             key,
             revision: row.revision,
             document: JSON.parse(row.json) as unknown,
+        }
+    }
+
+    async *getPartitions(table: string) {
+        await this.#throwIfClosed()
+        for (const [partition, rows] of this.#tables.get(table).entries()) {
+            await Promise.resolve()
+            if (rows.size !== 0) {
+                yield partition
+            }
         }
     }
 
@@ -134,6 +146,13 @@ class DelayedDocuments {
     async get(table: string, partition: string, key: string) {
         await using _ = await delayed()
         return await this.#inner.get(table, partition, key)
+    }
+
+    async *getPartitions(table: string) {
+        await using _ = await delayed()
+        for await (const partition of this.#inner.getPartitions(table)) {
+            yield partition
+        }
     }
 
     async *getPartition(table: string, partition: string, range?: KeyRange) {
@@ -216,6 +235,10 @@ class MapWithDefault<K, V> {
         const d = this.#default()
         this.#map.set(key, d)
         return d
+    }
+
+    entries() {
+        return this.#map.entries()
     }
 }
 

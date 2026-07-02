@@ -19,6 +19,7 @@ export type Connection = {
         partition: string,
         key: string,
     ) => Promise<Row<StoredDocument> & { partition: string; key: string }>
+    getPartitions: (table: string) => AsyncIterable<string>
     getPartition: (
         table: string,
         partition: string,
