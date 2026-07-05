@@ -92,13 +92,13 @@ type DocumentSet<Document> = {
     addOrUpdate: (
         key: string,
         document: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
     ) => Promise<Row<Document>>;
     converge: (
         key: string,
         target: (document: Document) => boolean,
         document: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
     ) => Promise<Row<Document>>;
     delete: (key: string, revision: Revision) => Promise<void>;
 };
@@ -153,7 +153,13 @@ async function updateUserProfile(context: object, userId: string, newProfile, re
 }
 ```
 
-`getOrAdd`, `addOrUpdate`, `converge` on `DocumentSet` are helper functions that manages concurrency issues by retrying conflict errors. Their `document` argument is added if it doesn't exist, `update` is called to mutate the document if it does exist, and `target` determines if the document needs updating. You can e.g. make updates idempotent like this:
+`getOrAdd`, `addOrUpdate`, `converge` on `DocumentSet` are helper functions that manages concurrency issues by retrying conflict errors. Their `document` argument is added if it doesn't exist, `update` is called if it does exist, and `target` determines if the document needs updating. The `update` callback may either mutate the existing document in place, or return a replacement document; when it returns a document, that document is persisted instead of the existing one. That makes whole-document replacement (PUT semantics) a one-liner:
+
+```ts
+documents.addOrUpdate(key, newDocument, () => newDocument);
+```
+
+You can e.g. make updates idempotent like this:
 
 ```ts
 type Document = { processedMessages: string[]; count: number };

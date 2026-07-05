@@ -89,7 +89,7 @@ type FixedKey<Document> = {
     addOrUpdate: (
         partition: string,
         document: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         action: 'add' | 'update'
@@ -101,7 +101,7 @@ type FixedKey<Document> = {
     addOrUpdateComputed: (
         partition: string,
         computed: () => Promise<Document> | Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         action: 'add' | 'update'
@@ -114,7 +114,7 @@ type FixedKey<Document> = {
         partition: string,
         target: (document: Document) => boolean,
         initial: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         partition: Revision
@@ -148,7 +148,7 @@ type NamedPartition<Document> = {
     addOrUpdate: (
         key: string,
         document: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         action: 'add' | 'update'
@@ -160,7 +160,7 @@ type NamedPartition<Document> = {
     addOrUpdateComputed: (
         key: string,
         computed: () => Promise<Document> | Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         action: 'add' | 'update'
@@ -173,7 +173,7 @@ type NamedPartition<Document> = {
         key: string,
         target: (document: Document) => boolean,
         initial: Document,
-        update: (existing: Document) => void,
+        update: (existing: Document) => Document | void,
         options?: RetryOptions,
     ) => Promise<{
         partition: Revision
@@ -295,7 +295,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             async addOrUpdate(
                 partition: string,
                 document: unknown,
-                update: (existing: unknown) => void,
+                update: (existing: unknown) => unknown,
                 options?: RetryOptions,
             ) {
                 const c = await db[connectionEntry]
@@ -304,7 +304,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             async addOrUpdateComputed<T>(
                 partition: string,
                 computed: () => Promise<T> | T,
-                update: (existing: T) => void,
+                update: (existing: T) => T | void,
                 options?: RetryOptions,
             ) {
                 const c = await db[connectionEntry]
@@ -322,7 +322,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 partition: string,
                 target: (document: T) => boolean,
                 initial: T,
-                update: (existing: T) => void,
+                update: (existing: T) => T | void,
                 options?: RetryOptions,
             ) {
                 const c = await db[connectionEntry]
@@ -332,7 +332,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 partition: string,
                 target: (document: T) => boolean,
                 computed: () => Promise<T> | T,
-                update: (existing: T) => void,
+                update: (existing: T) => T | void,
                 options?: RetryOptions,
             ) {
                 const c = await db[connectionEntry]
@@ -427,7 +427,7 @@ class Partition {
     async addOrUpdate(
         key: string,
         document: unknown,
-        update: (existing: unknown) => void,
+        update: (existing: unknown) => unknown,
         options?: RetryOptions,
     ) {
         const c = await this.#connection
@@ -436,7 +436,7 @@ class Partition {
     async addOrUpdateComputed(
         key: string,
         computed: () => Promise<unknown>,
-        update: (existing: unknown) => void,
+        update: (existing: unknown) => unknown,
         options?: RetryOptions,
     ) {
         const c = await this.#connection
@@ -454,7 +454,7 @@ class Partition {
         key: string,
         target: (document: T) => boolean,
         initial: T,
-        update: (existing: T) => void,
+        update: (existing: T) => T | void,
         options?: RetryOptions,
     ) {
         const c = await this.#connection
@@ -474,7 +474,7 @@ class Partition {
         key: string,
         target: (document: T) => boolean,
         computed: () => Promise<T> | T,
-        update: (existing: T) => void,
+        update: (existing: T) => T | void,
         options?: RetryOptions,
     ) {
         const c = await this.#connection
@@ -791,24 +791,25 @@ async function addOrUpdate<T>(
     partition: string,
     key: string,
     document: T,
-    update: (existing: T) => void,
+    update: (existing: T) => T | void,
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
         try {
             const row = await c.get(table, partition, key)
             const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            update(row.document as T)
+            const returned = update(row.document as T)
+            const updated = returned ?? (row.document as T)
             const revision = await updateWithIndexes(
                 c,
                 table,
                 partition,
                 key,
                 row.revision,
-                row.document,
+                updated,
                 oldEntries,
             )
-            return { action: 'update', partition, key, revision, document: row.document }
+            return { action: 'update', partition, key, revision, document: updated }
         } catch (e) {
             if (isNotFound(e)) {
                 const revision = await addWithIndexes(c, table, partition, key, document)
@@ -825,24 +826,25 @@ async function addOrUpdateComputed<T>(
     partition: string,
     key: string,
     computed: () => Promise<T> | T,
-    update: (existing: T) => void,
+    update: (existing: T) => T | void,
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
         try {
             const row = await c.get(table, partition, key)
             const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            update(row.document as T)
+            const returned = update(row.document as T)
+            const updated = returned ?? (row.document as T)
             const revision = await updateWithIndexes(
                 c,
                 table,
                 partition,
                 key,
                 row.revision,
-                row.document,
+                updated,
                 oldEntries,
             )
-            return { action: 'update', partition, key, revision, document: row.document }
+            return { action: 'update', partition, key, revision, document: updated }
         } catch (e) {
             if (isNotFound(e)) {
                 const document = await computed()
@@ -861,7 +863,7 @@ async function converge<T>(
     key: string,
     target: (document: T) => boolean,
     initial: T,
-    update: (existing: T) => void,
+    update: (existing: T) => T | void,
     options?: RetryOptions,
 ): Promise<Row> {
     assert.ok(target(initial), 'Initial document does not meet target.')
@@ -872,18 +874,19 @@ async function converge<T>(
                 return row
             }
             const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            update(row.document as T)
-            assert.ok(target(row.document as T), 'Updated document does not meet target.')
+            const returned = update(row.document as T)
+            const updated = returned ?? (row.document as T)
+            assert.ok(target(updated), 'Updated document does not meet target.')
             const revision = await updateWithIndexes(
                 c,
                 table,
                 partition,
                 key,
                 row.revision,
-                row.document,
+                updated,
                 oldEntries,
             )
-            return { partition, key, revision, document: row.document }
+            return { partition, key, revision, document: updated }
         } catch (e) {
             if (isNotFound(e)) {
                 const revision = await addWithIndexes(c, table, partition, key, initial)
@@ -901,7 +904,7 @@ async function convergeComputed<T>(
     key: string,
     target: (document: T) => boolean,
     initial: () => Promise<T> | T,
-    update: (existing: T) => void,
+    update: (existing: T) => T | void,
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
@@ -911,18 +914,19 @@ async function convergeComputed<T>(
                 return row
             }
             const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            update(row.document as T)
-            assert.ok(target(row.document as T), 'Updated document does not meet target.')
+            const returned = update(row.document as T)
+            const updated = returned ?? (row.document as T)
+            assert.ok(target(updated), 'Updated document does not meet target.')
             const revision = await updateWithIndexes(
                 c,
                 table,
                 partition,
                 key,
                 row.revision,
-                row.document,
+                updated,
                 oldEntries,
             )
-            return { partition, key, revision, document: row.document }
+            return { partition, key, revision, document: updated }
         } catch (e) {
             if (isNotFound(e)) {
                 const document = await initial()

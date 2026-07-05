@@ -1,6 +1,6 @@
 {
   "name": "@movogo-io/docs",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "type": "module",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
@@ -33,7 +33,6 @@
   },
   "mock": "test/mock",
   "scripts": {
-    "prepare": "tsc",
     "start": "riddance-watch",
     "prepack": "riddance-build",
     "prepublishOnly": "riddance-prepublish",
