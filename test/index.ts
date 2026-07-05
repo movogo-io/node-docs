@@ -269,6 +269,116 @@ describe('schema', () => {
         const { current } = await potent.getDocument('k1')
         assert.deepStrictEqual(current, 2)
     })
+
+    it('should replace', async () => {
+        type ConversationSchema = {
+            Conversations: {
+                [userId: string]: {
+                    [messageId: string]: {
+                        timestamp: string
+                        subject: string
+                        body: string
+                    }
+                }
+            }
+        }
+        await using context = new TestContext()
+
+        const userMessages = tables<ConversationSchema>(context).Conversations.partition('some-id')
+        const replacement = {
+            timestamp: '2025-11-19T12:31:00',
+            subject: 'nah',
+            body: 'bye',
+        }
+        const added = await userMessages.addOrUpdate(
+            'a',
+            { timestamp: '2025-11-19T12:30:00', subject: 'huh', body: 'hello' },
+            () => replacement,
+        )
+        assert.deepStrictEqual(added.action, 'add')
+        const updated = await userMessages.addOrUpdate(
+            'a',
+            { timestamp: '2025-11-19T12:30:00', subject: 'huh', body: 'hello' },
+            () => replacement,
+        )
+        assert.deepStrictEqual(updated.action, 'update')
+        assert.deepStrictEqual(updated.document, replacement)
+        assert.deepStrictEqual(await userMessages.getDocument('a'), replacement)
+
+        const computed = await userMessages.addOrUpdateComputed(
+            'a',
+            () => replacement,
+            existing => ({ ...existing, subject: 'yeah' }),
+        )
+        assert.deepStrictEqual(computed.action, 'update')
+        assert.deepStrictEqual(await userMessages.getDocument('a'), {
+            ...replacement,
+            subject: 'yeah',
+        })
+    })
+
+    it('should count with returned documents', async () => {
+        type CounterSchema = {
+            Counters: {
+                global: {
+                    value: {
+                        current: number
+                    }
+                }
+            }
+        }
+
+        await using context = new TestContext()
+
+        const { global } = tables<CounterSchema>(context).Counters
+
+        await Promise.all(
+            Array.from({ length: 20 }, () =>
+                global.addOrUpdate('value', { current: 1 }, doc => ({
+                    current: doc.current + 1,
+                })),
+            ),
+        )
+
+        assert.deepStrictEqual(await global.getDocument('value'), { current: 20 })
+    })
+
+    it('should support idempotency with returned documents', async () => {
+        type CounterSchema = {
+            Counters: {
+                potent: {
+                    [key: string]: {
+                        processedMessages: string[]
+                        current: number
+                    }
+                }
+            }
+        }
+
+        await using context = new TestContext()
+
+        const { potent } = tables<CounterSchema>(context).Counters
+
+        const messageId1 = randomUUID()
+        const messageId2 = randomUUID()
+
+        await Promise.all(
+            [messageId1, messageId1, messageId2, messageId1, messageId2].map(messageId =>
+                potent.converge(
+                    'k1',
+                    doc => doc.processedMessages.includes(messageId),
+                    { processedMessages: [messageId], current: 1 },
+                    doc => ({
+                        processedMessages: [...doc.processedMessages.slice(-7), messageId],
+                        current: doc.current + 1,
+                    }),
+                ),
+            ),
+        )
+
+        const { current } = await potent.getDocument('k1')
+        assert.deepStrictEqual(current, 2)
+    })
 })
 
 class TestContext {
