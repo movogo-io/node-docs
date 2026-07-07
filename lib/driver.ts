@@ -86,13 +86,21 @@ export type Connection = {
 let _driver: Driver = {
     connect: () => Promise.reject<Connection>(new Error('No driver set, please call setDriver()')),
 }
+const _decorators: ((driver: Driver) => Driver)[] = []
+let _decorated: Driver | undefined
 
 export function setDriver(driver: Driver) {
     const previous = _driver
     _driver = driver
+    _decorated = undefined
     return previous
 }
 
+export function decorateDriver(decorator: (driver: Driver) => Driver) {
+    _decorators.push(decorator)
+    _decorated = undefined
+}
+
 export function getDriver() {
-    return _driver
+    return (_decorated ??= _decorators.reduce((driver, decorator) => decorator(driver), _driver))
 }

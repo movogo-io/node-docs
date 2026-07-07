@@ -259,3 +259,15 @@ Rules and properties:
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
 - **Cost:** writes to an indexed table are transactional (roughly 2× write cost) and each index entry stores a copy of the document. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
 - **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
+
+## Driver Decoration
+
+Extension packages (auditing, tracing, metrics) can wrap the active driver with `decorateDriver` from `@movogo-io/docs/driver`:
+
+```ts
+import { decorateDriver, type Driver } from '@movogo-io/docs/driver';
+
+decorateDriver((driver: Driver) => wrapped(driver));
+```
+
+Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget.
