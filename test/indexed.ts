@@ -113,6 +113,39 @@ describe('indexes', () => {
         assert.deepStrictEqual(due, ['2026-07-01'])
     })
 
+    it('should drop documents leaving a sparse index', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        const revision = await rentals.partition('s1').add('r1', aRental({ due: '2026-07-01' }))
+
+        await rentals.partition('s1').update('r1', revision, aRental())
+
+        assert.deepStrictEqual(
+            await Array.fromAsync(byStatus(context).pending.getRange({ withPrefix: '' })),
+            [],
+        )
+    })
+
+    it('should move index entries between named partitions', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        const revision = await rentals.partition('s1').add('r1', aRental({ due: '2026-07-01' }))
+
+        await rentals
+            .partition('s1')
+            .update('r1', revision, aRental({ due: '2026-07-01', status: 'active' }))
+
+        assert.deepStrictEqual(
+            await Array.fromAsync(byStatus(context).pending.getRange({ withPrefix: '' })),
+            [],
+        )
+        const active = await Array.fromAsync(
+            byStatus(context).active.getRange({ withPrefix: '' }),
+            row => row.key,
+        )
+        assert.deepStrictEqual(active, ['2026-07-01'])
+    })
+
     it('should update documents found through an index', async () => {
         await using context = new TestContext()
         const rentals = schema.tables(context).IndexedRentals
