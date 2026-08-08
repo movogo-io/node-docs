@@ -40,6 +40,7 @@ let _driver: Driver = {
 
 export function setDriver(driver: Driver) {
     const previous = _driver
+    // eslint-disable-next-line unicorn/no-top-level-assignment-in-function
     _driver = driver
     return previous
 }

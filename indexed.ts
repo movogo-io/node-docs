@@ -97,7 +97,7 @@ type GenericProxyTarget = { [k: string | symbol]: unknown }
 
 const indexProxy = {
     get: (target: GenericProxyTarget & ReturnType<typeof indexBase>, property: string | symbol) => {
-        if (property in target) {
+        if (Object.hasOwn(target, property)) {
             return target[property]
         }
         if (typeof property === 'symbol') {

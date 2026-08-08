@@ -30,6 +30,9 @@
     "postpublish": "riddance-sync"
   },
   "devDependencies": {
-    "@riddance/env": "0.10.0"
+    "@riddance/env": "0.10.2"
+  },
+  "allowScripts": {
+    "@riddance/env": true
   }
 }

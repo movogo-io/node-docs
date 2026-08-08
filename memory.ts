@@ -110,15 +110,15 @@ class MemoryDocuments {
         p.delete(key)
     }
 
+    close() {
+        this.#closed = true
+        return Promise.resolve()
+    }
+
     #throwIfClosed() {
         if (this.#closed) {
             return Promise.reject(new Error('Connection has been closed.'))
         }
-        return Promise.resolve()
-    }
-
-    close() {
-        this.#closed = true
         return Promise.resolve()
     }
 }
@@ -184,9 +184,8 @@ function matchRange(range?: KeyRange) {
         if (after) {
             if (before) {
                 return (key: string) => after <= key && key < before
-            } else {
-                return (key: string) => after <= key
             }
+            return (key: string) => after <= key
         }
         if (before) {
             return (key: string) => key < before

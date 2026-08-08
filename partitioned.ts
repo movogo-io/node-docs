@@ -218,7 +218,7 @@ const tablesProxy = {
         target: GenericProxyTarget & ReturnType<typeof tablesBase>,
         property: string | symbol,
     ) => {
-        if (property in target) {
+        if (Object.hasOwn(target, property)) {
             return target[property]
         }
         if (typeof property === 'symbol') {
@@ -336,7 +336,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
 
 const tableProxy = {
     get: (target: GenericProxyTarget & ReturnType<typeof tableBase>, property: string | symbol) => {
-        if (property in target) {
+        if (Object.hasOwn(target, property)) {
             return target[property]
         }
         if (typeof property === 'symbol') {

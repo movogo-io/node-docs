@@ -257,6 +257,7 @@ describe('schema', () => {
                     { processedMessages: [messageId], current: 1 },
                     doc => {
                         if (doc.processedMessages.length === 8) {
+                            // eslint-disable-next-line unicorn/no-array-front-mutation
                             doc.processedMessages.shift()
                         }
                         doc.processedMessages.push(messageId)
