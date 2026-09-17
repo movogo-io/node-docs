@@ -15,8 +15,5 @@ export function isConflict(e: unknown) {
 }
 
 function hasStatus(e: unknown, status: number) {
-    if (typeof e !== 'object' || e === null) {
-        return false
-    }
-    return ('status' in e && e.status === status) || ('statusCode' in e && e.statusCode === status)
+    return typeof e === 'object' && e !== null && 'status' in e && e.status === status
 }

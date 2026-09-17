@@ -155,7 +155,7 @@ async function updateUserProfile(context: object, userId: string, newProfile, re
 }
 ```
 
-Not-found and conflict errors carry `statusCode` 404 and 409, so one that escapes a @riddance/service handler — typically a conflict once the retries of a helper or `withTransaction` are spent — is answered 404 or 409, not 500.
+Not-found and conflict errors carry `statusCode` 404 and 409, so one that escapes a @riddance/service handler — typically a conflict once the retries of a helper or `withTransaction` are spent — is answered 404 or 409, not 500. `isNotFound` and `isConflict` identify errors raised by the store, not any 404 or 409: an error carrying only `statusCode`, such as one from `@riddance/service`, does not match, so a domain conflict thrown inside a retrying helper is not retried and not mistaken for contention.
 
 Range bounds are inclusive for `after` and exclusive for `before`, and an empty string is a bound like any other: `{ after: '' }` matches every key and `{ before: '' }` none.
 
