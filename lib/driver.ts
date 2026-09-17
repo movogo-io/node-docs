@@ -83,32 +83,41 @@ export type Connection = {
     transact: (items: TransactionItem[]) => Promise<void>
 }
 
-let _driver: Driver = {
-    connect: () => Promise.reject<Connection>(new Error('No driver set, please call setDriver()')),
+const state: {
+    driver: Driver
+    decorators: ((driver: Driver) => Driver)[]
+    decorated?: Driver
+} = {
+    driver: {
+        connect: () =>
+            Promise.reject<Connection>(new Error('No driver set, please call setDriver()')),
+    },
+    decorators: [],
 }
-const _decorators: ((driver: Driver) => Driver)[] = []
-let _decorated: Driver | undefined
 
 export function setDriver(driver: Driver) {
-    const previous = _driver
-    _driver = driver
-    _decorated = undefined
+    const previous = state.driver
+    state.driver = driver
+    state.decorated = undefined
     return previous
 }
 
 export function decorateDriver(decorator: (driver: Driver) => Driver) {
-    _decorators.push(decorator)
-    _decorated = undefined
+    state.decorators.push(decorator)
+    state.decorated = undefined
     return () => {
-        const index = _decorators.lastIndexOf(decorator)
+        const index = state.decorators.lastIndexOf(decorator)
         if (index === -1) {
             return
         }
-        _decorators.splice(index, 1)
-        _decorated = undefined
+        state.decorators.splice(index, 1)
+        state.decorated = undefined
     }
 }
 
 export function getDriver() {
-    return (_decorated ??= _decorators.reduce((driver, decorator) => decorator(driver), _driver))
+    return (state.decorated ??= state.decorators.reduce(
+        (driver, decorator) => decorator(driver),
+        state.driver,
+    ))
 }

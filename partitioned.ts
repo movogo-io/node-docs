@@ -228,7 +228,7 @@ type GenericProxyTarget = { [k: string | symbol]: unknown }
 function facadeProxy<B extends object>(sub: (target: B, name: string) => unknown): ProxyHandler<B> {
     return {
         get: (target, property) => {
-            if (property in target) {
+            if (Object.hasOwn(target, property)) {
                 return (target as GenericProxyTarget)[property]
             }
             if (typeof property === 'symbol') {

@@ -322,11 +322,11 @@ describe('indexes', () => {
         await using context = new TestContext()
         const rentals = schema.tables(context).IndexedRentals
         await assert.rejects(
-            rentals.partition('s1').add('r\u00001', aRental()),
+            rentals.partition('s1').add('r\u{0}1', aRental()),
             /reserved character/u,
         )
         await assert.rejects(
-            rentals.partition('s1').add('r1', aRental({ unitId: 'u\u00001' })),
+            rentals.partition('s1').add('r1', aRental({ unitId: 'u\u{0}1' })),
             /reserved character/u,
         )
     })

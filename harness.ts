@@ -449,7 +449,7 @@ export function harness(
 
     it('ranges keys containing the reserved separator', async () => {
         const partition = anId()
-        const separator = '\u0000'
+        const separator = '\u{0}'
         const doc1 = aDocument()
         const doc2 = aDocument()
         await using c = await connect(driver, contextFactory)

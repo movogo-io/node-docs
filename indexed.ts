@@ -132,7 +132,7 @@ function indexPartitionsProxy<B extends object>(
 ): ProxyHandler<B> {
     return {
         get: (target, property) => {
-            if (property in target) {
+            if (Object.hasOwn(target, property)) {
                 return (target as GenericProxyTarget)[property]
             }
             if (typeof property === 'symbol') {

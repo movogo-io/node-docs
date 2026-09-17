@@ -7,7 +7,7 @@ import { maxTransactionItems } from './transaction.js'
 // physical key of an index entry. Being the smallest possible character, it is
 // the only delimiter that keeps prefix and before/after range semantics on the
 // physical keys identical to those on the undecorated index key values.
-export const indexKeyDelimiter = '\u0000'
+export const indexKeyDelimiter = '\u{0}'
 
 export type IndexSourceRow = {
     partition: string
@@ -192,7 +192,7 @@ export async function expandIndexOperations(
     c: Connection,
     items: TransactionItem[],
 ): Promise<TransactionItem[]> {
-    if (!items.some(item => hasIndexes(item.table))) {
+    if (items.every(item => !hasIndexes(item.table))) {
         return items
     }
     const expanded = await Promise.all(

@@ -5,6 +5,7 @@ let previous: Driver
 
 export const mochaHooks = {
     beforeEach() {
+        // eslint-disable-next-line unicorn/no-top-level-assignment-in-function
         previous = setDriver(new PersistentMemoryDriver())
     },
     afterEach() {

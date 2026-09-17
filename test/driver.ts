@@ -16,9 +16,10 @@ describe('driver decoration', () => {
     const removers: (() => void)[] = []
 
     afterEach(() => {
-        for (const remove of removers.splice(0)) {
+        for (const remove of removers) {
             remove()
         }
+        removers.length = 0
         seen.length = 0
     })
 

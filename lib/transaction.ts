@@ -39,6 +39,11 @@ export class TransactionBuffer {
         return this.#enqueue({ op: 'delete', table, partition, key, revision }, undefined)
     }
 
+    seal() {
+        this.#sealed = true
+        return this.#items
+    }
+
     #enqueue<T>(item: TransactionItem, result: T) {
         if (this.#sealed) {
             return Promise.reject(new Error('Transaction has already been committed.'))
@@ -61,10 +66,5 @@ export class TransactionBuffer {
         this.#touched.add(id)
         this.#items.push(item)
         return Promise.resolve(result)
-    }
-
-    seal() {
-        this.#sealed = true
-        return this.#items
     }
 }
