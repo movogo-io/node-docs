@@ -82,8 +82,8 @@ export type IndexRow<Document> = {
 }
 
 type Index<Document> = {
-    get: (key: string) => Promise<IndexRow<Document> | undefined>
-    getDocument: (key: string) => Promise<Document | undefined>
+    first: (key: string) => Promise<IndexRow<Document> | undefined>
+    firstDocument: (key: string) => Promise<Document | undefined>
     getRange: (range: KeyRange) => AsyncIterable<IndexRow<Document>>
 }
 
@@ -154,7 +154,7 @@ class IndexReader {
         this.#partition = partition
     }
 
-    async get(key: string) {
+    async first(key: string) {
         assertClean(key, 'index key')
         const rows = this.#rows({ withPrefix: key + indexKeyDelimiter })
         try {
@@ -165,8 +165,8 @@ class IndexReader {
         }
     }
 
-    async getDocument(key: string) {
-        return (await this.get(key))?.document
+    async firstDocument(key: string) {
+        return (await this.first(key))?.document
     }
 
     async *getRange(range: KeyRange) {

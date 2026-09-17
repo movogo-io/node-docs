@@ -99,6 +99,14 @@ export function setDriver(driver: Driver) {
 export function decorateDriver(decorator: (driver: Driver) => Driver) {
     _decorators.push(decorator)
     _decorated = undefined
+    return () => {
+        const index = _decorators.lastIndexOf(decorator)
+        if (index === -1) {
+            return
+        }
+        _decorators.splice(index, 1)
+        _decorated = undefined
+    }
 }
 
 export function getDriver() {

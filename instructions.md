@@ -61,7 +61,7 @@ type Schema = {
 The schema is then used with the `tables` functions taking the @riddance/service context, like this:
 
 ```ts
-import { tables } from "@riddance/docs";
+import { tables } from "@movogo-io/docs";
 
 // Arbitrary strings as partition and key
 const userMessages = tables<Schema>(context).Conversations.partition(userId);
@@ -104,6 +104,8 @@ type DocumentSet<Document> = {
 };
 type Row<Document> = { key: string; revision: Revision; document: Document };
 ```
+
+Each table also exposes `getPartitions()`, an async iterable of the partition keys currently holding documents. In DynamoDB that is a full-table scan whose cost grows with everything ever stored, so reserve it for sweeps and migrations and never call it from a request handler.
 
 Consider adding helper functions to `./lib/schema.ts` like this
 
@@ -183,7 +185,7 @@ documents.converge(
 `withTransaction` applies writes to multiple documents — across partitions and tables — atomically: either all of them are applied, or none of them are. Use it when several tables express different access patterns over the same data (e.g. a main table plus a lookup table) and a partial write would corrupt the invariant between them.
 
 ```ts
-import { withTransaction } from "@riddance/docs";
+import { withTransaction } from "@movogo-io/docs";
 
 await withTransaction<Schema>(context, async (tx) => {
     const row = await tx.Outbox.partition(userId).get(messageId);
@@ -195,9 +197,9 @@ await withTransaction<Schema>(context, async (tx) => {
 The `tx` argument mirrors the `tables` surface with these rules:
 
 - **Writes are buffered.** `add`, `update`, `updateRow`, `check`, and `delete` do not touch storage when called; they are queued and applied atomically when the callback resolves. Returned revisions are final and usable after the commit.
-- **Reads return committed state.** `get`, `getDocument`, `getAll`, `getRange`, and `getPartitions` pass through to storage — you cannot read your own buffered writes.
+- **Reads return committed state.** `get`, `getDocument`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction.
 - **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
-- **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — throw immediately and are not retried.
+- **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried.
 - **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
 - The retry helpers (`getOrAdd`, `addOrUpdate`, `converge`) are not available inside a transaction; the whole-transaction retry replaces them.
 - If the callback throws, nothing is written.
@@ -212,7 +214,7 @@ A table can declare additional access patterns as **secondary indexes**: alterna
 Declare indexes once, next to the schema in `./lib/schema.ts`, through the `docs` handle:
 
 ```ts
-import { docs } from "@riddance/docs/indexed";
+import { docs } from "@movogo-io/docs/indexed";
 
 const schema = docs<Schema>();
 
@@ -241,7 +243,7 @@ Both extractors receive `{ partition, key, document }` of the row being written 
 
 ```ts
 // Open-string index partitions:
-const row = await rentalsByUnit(context).partition(unitId).get(rentalId);
+const row = await rentalsByUnit(context).partition(unitId).first(rentalId);
 // row: { key, revision, document, source: { partition, key } } | undefined
 
 // Literal-union index partitions become named accessors:
@@ -255,9 +257,9 @@ Rules and properties:
 - **Declare before the first write.** Writes consult the registered definitions, so `schema.index` calls must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
 - **Maintenance is atomic.** Every write to an indexed table (including the retry helpers and writes inside `withTransaction`) commits the document and its index entries in one transaction; a document can never be observed missing from, or stale in, an index. Reads are as consistent as the main table.
 - **Index rows carry the document and its revision.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`.
-- `get` returns `undefined` when nothing matches (several rows may share an index key; `get` returns the first in key order). `getRange` accepts the same ranges as `getRange` on a table.
+- **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table.
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
-- **Cost:** writes to an indexed table are transactional (roughly 2× write cost) and each index entry stores a copy of the document. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
+- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `update` or `delete` additionally reads the current document first, to find the entries to remove, unless it runs through a retry helper that has already read it. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
 - **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
 
 ## Driver Decoration
@@ -270,4 +272,4 @@ import { decorateDriver, type Driver } from '@movogo-io/docs/driver';
 decorateDriver((driver: Driver) => wrapped(driver));
 ```
 
-Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget.
+Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget.

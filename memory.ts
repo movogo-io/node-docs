@@ -77,7 +77,7 @@ class MemoryDocuments {
     async *getPartition(table: string, partition: string, range?: KeyRange) {
         await this.#throwIfClosed()
         const matches = matchRange(range)
-        for (const [key, row] of this.#tables.get(table).get(partition)) {
+        for (const [key, row] of sortedByKey(this.#tables.get(table).get(partition))) {
             await Promise.resolve()
             if (matches(key)) {
                 yield {
@@ -125,6 +125,7 @@ class MemoryDocuments {
 
     async transact(items: TransactionItem[]) {
         await this.#throwIfClosed()
+        throwIfAnyDocumentRepeats(items)
         const applies = items.map(item => {
             const p = this.#tables.get(item.table).get(item.partition)
             const existing = p.get(item.key)
@@ -236,6 +237,31 @@ class DelayedDocuments {
     async close() {
         await using _ = await delayed()
         await this.#inner.close()
+    }
+}
+
+function sortedByKey(rows: Map<string, Row>) {
+    return [...rows].sort(([a], [b]) => {
+        if (a < b) {
+            return -1
+        }
+        if (b < a) {
+            return 1
+        }
+        return 0
+    })
+}
+
+function throwIfAnyDocumentRepeats(items: TransactionItem[]) {
+    const touched = new Set<string>()
+    for (const item of items) {
+        const id = JSON.stringify([item.table, item.partition, item.key])
+        if (touched.has(id)) {
+            throw new Error(
+                `Transaction contains more than one operation on '${item.key}' in partition '${item.partition}' of table '${item.table}'.`,
+            )
+        }
+        touched.add(id)
     }
 }
 

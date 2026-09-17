@@ -115,6 +115,21 @@ export function harness(
         )
     })
 
+    it('gets keys in order regardless of insertion order', async () => {
+        await using c = await connect(driver, contextFactory)
+        const partition = anId()
+        await c.docs.add(table, partition, 'b', aDocument({ key: 'b' }))
+        await c.docs.add(table, partition, 'c', aDocument({ key: 'c' }))
+        await c.docs.add(table, partition, 'a', aDocument({ key: 'a' }))
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition),
+                r => (r.document as { key: string }).key,
+            ),
+            ['a', 'b', 'c'],
+        )
+    })
+
     it('gets no partitions from unused table', async () => {
         await using c = await connect(driver, contextFactory)
         assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartitions(anId())), [])
@@ -178,6 +193,19 @@ export function harness(
         const otherRow = await c.docs.get(otherTable, partition, key)
         assert.deepStrictEqual(otherRow.document, other)
         assert.strictEqual(otherRow.revision, otherRevision)
+    })
+
+    it('rejects two operations on one document', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        await assert.rejects(
+            c.docs.transact([
+                { op: 'add', table, partition, key, document: added, newRevision: anId() },
+                { op: 'clear', table, partition, key },
+            ]),
+            e => !isConflict(e) && !isNotFound(e),
+        )
+        await assert.rejects(c.docs.get(table, partition, key), isNotFound)
     })
 
     it('transacts nothing when any add conflicts', async () => {

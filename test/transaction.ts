@@ -166,7 +166,7 @@ describe('transactions', () => {
         })
 
         assert.ok(leaked)
-        assert.throws(() => leaked?.('r9', { name: 'x', count: 0 }), /already been committed/u)
+        await assert.rejects(leaked('r9', { name: 'x', count: 0 }), /already been committed/u)
     })
 
     it('should skip the driver call when nothing was written', async () => {

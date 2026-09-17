@@ -513,20 +513,16 @@ type TransactionPartitionsWithFixedKey<Schema, Table extends TableNamesOf<Schema
     withKey<K extends KeyOf<Schema, Table>>(
         key: K,
     ): TransactionFixedKey<DocumentOfFixedKey<Schema, Table, K>>
-    getPartitions(): AsyncIterable<string>
 }
 
 type NamedTransactionPartitions<Schema, Table extends TableNamesOf<Schema>> = {
     readonly [P in PartitionKeyOf<Schema, Table>]: TransactionNamedPartition<
         DocumentOfFixedPartition<Schema, Table, P>
     >
-} & {
-    getPartitions(): AsyncIterable<string>
 }
 
 type TransactionPartitions<Schema, Table extends TableNamesOf<Schema>> = {
     partition(partition: string): TransactionNamedPartition<DocumentOf<Schema, Table>>
-    getPartitions(): AsyncIterable<string>
 }
 
 type TransactionFixedKey<Document> = {
@@ -617,12 +613,6 @@ function transactionTableBase(db: ReturnType<typeof transactionTablesBase>, tabl
             new TransactionFixedKeySet(db[connectionEntry], db[bufferEntry], table, key),
         partition: (partition: string) =>
             new TransactionPartition(db[connectionEntry], db[bufferEntry], table, partition),
-        async *getPartitions() {
-            const c = await db[connectionEntry]
-            for await (const partition of c.getPartitions(table)) {
-                yield partition
-            }
-        },
     }
 }
 

@@ -50,11 +50,11 @@ describe('indexes', () => {
         await rentals.partition('s1').add('r1', aRental({ unitId: 'u1' }))
         await rentals.partition('s2').add('r2', aRental({ unitId: 'u2' }))
 
-        const found = await byUnit(context).partition('u1').get('r1')
+        const found = await byUnit(context).partition('u1').first('r1')
         assert.deepStrictEqual(found?.document, aRental({ unitId: 'u1' }))
         assert.deepStrictEqual(found.source, { partition: 's1', key: 'r1' })
-        assert.strictEqual(await byUnit(context).partition('u1').getDocument('r2'), undefined)
-        assert.strictEqual(await byUnit(context).partition('u3').get('r1'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u1').firstDocument('r2'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u3').first('r1'), undefined)
     })
 
     it('should read a whole index partition', async () => {
@@ -68,7 +68,7 @@ describe('indexes', () => {
             byId(context).all.getRange({ withPrefix: '' }),
             row => row.key,
         )
-        assert.deepStrictEqual(keys.sort(), ['r1', 'r2', 'r3'])
+        assert.deepStrictEqual(keys, ['r1', 'r2', 'r3'])
     })
 
     it('should move index entries when documents change', async () => {
@@ -78,8 +78,8 @@ describe('indexes', () => {
 
         await rentals.partition('s1').update('r1', revision, aRental({ unitId: 'u2' }))
 
-        assert.strictEqual(await byUnit(context).partition('u1').get('r1'), undefined)
-        const moved = await byUnit(context).partition('u2').get('r1')
+        assert.strictEqual(await byUnit(context).partition('u1').first('r1'), undefined)
+        const moved = await byUnit(context).partition('u2').first('r1')
         assert.deepStrictEqual(moved?.document, aRental({ unitId: 'u2' }))
     })
 
@@ -90,8 +90,8 @@ describe('indexes', () => {
 
         await rentals.partition('s1').delete('r1', revision)
 
-        assert.strictEqual(await byUnit(context).partition('u1').get('r1'), undefined)
-        assert.strictEqual(await byId(context).all.get('r1'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u1').first('r1'), undefined)
+        assert.strictEqual(await byId(context).all.first('r1'), undefined)
     })
 
     it('should omit documents from sparse indexes', async () => {
@@ -151,13 +151,13 @@ describe('indexes', () => {
         const rentals = schema.tables(context).IndexedRentals
         await rentals.partition('s1').add('r1', aRental({ unitId: 'u1' }))
 
-        const found = await byUnit(context).partition('u1').get('r1')
+        const found = await byUnit(context).partition('u1').first('r1')
         assert.ok(found)
         await rentals
             .partition(found.source.partition)
             .update(found.source.key, found.revision, aRental({ unitId: 'u1', name: 'renamed' }))
 
-        const renamed = await byUnit(context).partition('u1').get('r1')
+        const renamed = await byUnit(context).partition('u1').first('r1')
         assert.strictEqual(renamed?.document.name, 'renamed')
     })
 
@@ -175,12 +175,67 @@ describe('indexes', () => {
             await tx.IndexedRentals.partition('s1').add('r2', aRental({ unitId: 'u2' }))
         })
 
-        assert.strictEqual(await byUnit(context).partition('u1').get('r1'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u1').first('r1'), undefined)
         const keys = await Array.fromAsync(
             byUnit(context).partition('u2').getRange({ withPrefix: '' }),
             row => row.key,
         )
-        assert.deepStrictEqual(keys.sort(), ['r1', 'r2'])
+        assert.deepStrictEqual(keys, ['r1', 'r2'])
+    })
+
+    it('should remove index entries when documents are deleted inside transactions', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        const revision = await rentals.partition('s1').add('r1', aRental({ unitId: 'u1' }))
+
+        await withTransaction<Schema>(context, async tx => {
+            await tx.IndexedRentals.partition('s1').delete('r1', revision)
+            await tx.IndexedRentals.partition('s1').add('r2', aRental({ unitId: 'u1' }))
+        })
+
+        const keys = await Array.fromAsync(
+            byUnit(context).partition('u1').getRange({ withPrefix: '' }),
+            row => row.key,
+        )
+        assert.deepStrictEqual(keys, ['r2'])
+        assert.strictEqual(await byId(context).all.first('r1'), undefined)
+    })
+
+    it('should count index maintenance toward the transaction limit', async () => {
+        await using context = new TestContext()
+
+        await assert.rejects(
+            withTransaction<Schema>(context, async tx => {
+                for (let i = 0; i !== 40; ++i) {
+                    await tx.IndexedRentals.partition('s1').add(`r${String(i)}`, aRental())
+                }
+            }),
+            /40 requested operations expanded to 120/u,
+        )
+
+        assert.strictEqual(await byId(context).all.first('r0'), undefined)
+    })
+
+    it('should range index keys that are prefixes of each other', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        await rentals.partition('s1').add('r1', aRental({ due: '2026-07-01' }))
+        await rentals.partition('s1').add('r2', aRental({ due: '2026-07-01T12:00' }))
+        await rentals.partition('s1').add('r3', aRental({ due: '2026-07-02' }))
+
+        const { pending } = byStatus(context)
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                pending.getRange({ after: '2026-07-01', before: '2026-07-01T12:00' }),
+                row => row.source.key,
+            ),
+            ['r1'],
+        )
+        assert.deepStrictEqual(
+            await Array.fromAsync(pending.getRange({ withPrefix: '2026-07-01' }), row => row.key),
+            ['2026-07-01', '2026-07-01T12:00'],
+        )
+        assert.deepStrictEqual((await pending.first('2026-07-01'))?.source.key, 'r1')
     })
 
     it('should maintain nothing when a transaction fails', async () => {
@@ -204,9 +259,9 @@ describe('indexes', () => {
             isConflict,
         )
 
-        assert.strictEqual(await byUnit(context).partition('u2').get('r2'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u2').first('r2'), undefined)
         assert.deepStrictEqual(
-            (await byUnit(context).partition('u1').get('r1'))?.document,
+            (await byUnit(context).partition('u1').first('r1'))?.document,
             aRental({ unitId: 'u1' }),
         )
     })

@@ -11,15 +11,19 @@ type Schema = {
     }
 }
 
-const seen: string[] = []
-decorateDriver(recording('early'))
-
 describe('driver decoration', () => {
-    beforeEach(() => {
+    const seen: string[] = []
+    const removers: (() => void)[] = []
+
+    afterEach(() => {
+        for (const remove of removers.splice(0)) {
+            remove()
+        }
         seen.length = 0
     })
 
     it('applies decorators registered before the driver is set', async () => {
+        removers.push(decorateDriver(recording('early', seen)))
         setDriver(new MemoryDriver())
         await using db = tables<Schema>({})
         await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
@@ -28,27 +32,49 @@ describe('driver decoration', () => {
 
     it('applies decorators registered after the driver is set', async () => {
         setDriver(new MemoryDriver())
-        decorateDriver(recording('late'))
+        removers.push(decorateDriver(recording('late', seen)))
         await using db = tables<Schema>({})
         await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
-        assert.deepStrictEqual(seen, ['late add DecoratedDocs', 'early add DecoratedDocs'])
+        assert.deepStrictEqual(seen, ['late add DecoratedDocs'])
     })
 
-    it('keeps decorators when the driver is replaced', async () => {
+    it('wraps later decorators around earlier ones', async () => {
+        removers.push(
+            decorateDriver(recording('inner', seen)),
+            decorateDriver(recording('outer', seen)),
+        )
         setDriver(new MemoryDriver())
         await using db = tables<Schema>({})
         await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
-        assert.deepStrictEqual(seen, ['late add DecoratedDocs', 'early add DecoratedDocs'])
+        assert.deepStrictEqual(seen, ['outer add DecoratedDocs', 'inner add DecoratedDocs'])
+    })
+
+    it('keeps decorators when the driver is replaced', async () => {
+        removers.push(decorateDriver(recording('kept', seen)))
+        setDriver(new MemoryDriver())
+        setDriver(new MemoryDriver())
+        await using db = tables<Schema>({})
+        await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
+        assert.deepStrictEqual(seen, ['kept add DecoratedDocs'])
+    })
+
+    it('stops applying removed decorators', async () => {
+        const remove = decorateDriver(recording('removed', seen))
+        setDriver(new MemoryDriver())
+        remove()
+        await using db = tables<Schema>({})
+        await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
+        assert.deepStrictEqual(seen, [])
     })
 })
 
-function recording(label: string) {
+function recording(label: string, seen: string[]) {
     return (driver: Driver): Driver => ({
-        connect: async context => delegating(label, await driver.connect(context)),
+        connect: async context => delegating(label, seen, await driver.connect(context)),
     })
 }
 
-function delegating(label: string, inner: Connection): Connection {
+function delegating(label: string, seen: string[], inner: Connection): Connection {
     return {
         close: () => inner.close(),
         add: (table, partition, key, document) => {
