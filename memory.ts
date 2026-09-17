@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
 import type { TransactionItem } from './lib/driver.js'
+import { conflict, notFound } from './lib/errors.js'
 import type { KeyRange } from './schema.js'
 
 const documentsEntry = Symbol()
@@ -31,6 +32,7 @@ export class DelayedPersistentMemoryDriver {
 type Row = {
     json: string
     revision: string
+    expiresAt?: number
 }
 
 class MemoryDocuments {
@@ -39,14 +41,20 @@ class MemoryDocuments {
     )
     #closed = false
 
-    async add(table: string, partition: string, key: string, document: unknown) {
+    async add(
+        table: string,
+        partition: string,
+        key: string,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
         await this.#throwIfClosed()
         const revision = randomUUID()
         const p = this.#tables.get(table).get(partition)
-        if (p.get(key)) {
+        if (isLive(p.get(key), options.now)) {
             throw conflict()
         }
-        p.set(key, { revision, json: JSON.stringify(document) })
+        p.set(key, storedRow(revision, document, options.expiresAt))
         return revision
     }
 
@@ -56,12 +64,7 @@ class MemoryDocuments {
         if (!row) {
             throw notFound()
         }
-        return {
-            partition,
-            key,
-            revision: row.revision,
-            document: JSON.parse(row.json) as unknown,
-        }
+        return { partition, ...readRow(key, row) }
     }
 
     async *getPartitions(table: string) {
@@ -80,11 +83,7 @@ class MemoryDocuments {
         for (const [key, row] of sortedByKey(this.#tables.get(table).get(partition))) {
             await Promise.resolve()
             if (matches(key)) {
-                yield {
-                    key,
-                    revision: row.revision,
-                    document: JSON.parse(row.json) as unknown,
-                }
+                yield readRow(key, row)
             }
         }
     }
@@ -95,35 +94,34 @@ class MemoryDocuments {
         key: string,
         currentRevision: unknown,
         document: unknown,
+        options: { now: number; expiresAt?: number },
     ) {
         await this.#throwIfClosed()
         const p = this.#tables.get(table).get(partition)
-        const r = p.get(key)
-        if (!r) {
-            throw conflict()
-        }
-        if (r.revision !== currentRevision) {
+        if (!hasRevision(p.get(key), currentRevision, options.now)) {
             throw conflict()
         }
         const revision = randomUUID()
-        p.set(key, { revision, json: JSON.stringify(document) })
+        p.set(key, storedRow(revision, document, options.expiresAt))
         return revision
     }
 
-    async delete(table: string, partition: string, key: string, currentRevision: unknown) {
+    async delete(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        options: { now: number },
+    ) {
         await this.#throwIfClosed()
         const p = this.#tables.get(table).get(partition)
-        const r = p.get(key)
-        if (!r) {
-            throw conflict()
-        }
-        if (r.revision !== currentRevision) {
+        if (!hasRevision(p.get(key), currentRevision, options.now)) {
             throw conflict()
         }
         p.delete(key)
     }
 
-    async transact(items: TransactionItem[]) {
+    async transact(items: TransactionItem[], options: { now: number }) {
         await this.#throwIfClosed()
         throwIfAnyDocumentRepeats(items)
         const applies = items.map(item => {
@@ -131,39 +129,30 @@ class MemoryDocuments {
             const existing = p.get(item.key)
             switch (item.op) {
                 case 'add':
-                    if (existing) {
+                    if (isLive(existing, options.now)) {
                         throw conflict()
                     }
                     return () =>
-                        p.set(item.key, {
-                            revision: item.newRevision as string,
-                            json: JSON.stringify(item.document),
-                        })
+                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
                 case 'update':
-                    if (!existing || existing.revision !== item.revision) {
+                    if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
                     return () =>
-                        p.set(item.key, {
-                            revision: item.newRevision as string,
-                            json: JSON.stringify(item.document),
-                        })
+                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
                 case 'delete':
-                    if (!existing || existing.revision !== item.revision) {
+                    if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
                     return () => p.delete(item.key)
                 case 'check':
-                    if (!existing || existing.revision !== item.revision) {
+                    if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
                     return () => undefined
                 case 'put':
                     return () =>
-                        p.set(item.key, {
-                            revision: item.newRevision as string,
-                            json: JSON.stringify(item.document),
-                        })
+                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
                 case 'clear':
                     return () => p.delete(item.key)
             }
@@ -189,9 +178,15 @@ class MemoryDocuments {
 class DelayedDocuments {
     readonly #inner = new MemoryDocuments()
 
-    async add(table: string, partition: string, key: string, document: unknown) {
+    async add(
+        table: string,
+        partition: string,
+        key: string,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
         await using _ = await delayed()
-        return await this.#inner.add(table, partition, key, document)
+        return await this.#inner.add(table, partition, key, document, options)
     }
 
     async get(table: string, partition: string, key: string) {
@@ -219,25 +214,57 @@ class DelayedDocuments {
         key: string,
         currentRevision: unknown,
         document: unknown,
+        options: { now: number; expiresAt?: number },
     ) {
         await using _ = await delayed()
-        return await this.#inner.update(table, partition, key, currentRevision, document)
+        return await this.#inner.update(table, partition, key, currentRevision, document, options)
     }
 
-    async delete(table: string, partition: string, key: string, currentRevision: unknown) {
+    async delete(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        options: { now: number },
+    ) {
         await using _ = await delayed()
-        await this.#inner.delete(table, partition, key, currentRevision)
+        await this.#inner.delete(table, partition, key, currentRevision, options)
     }
 
-    async transact(items: TransactionItem[]) {
+    async transact(items: TransactionItem[], options: { now: number }) {
         await using _ = await delayed()
-        await this.#inner.transact(items)
+        await this.#inner.transact(items, options)
     }
 
     async close() {
         await using _ = await delayed()
         await this.#inner.close()
     }
+}
+
+function storedRow(revision: unknown, document: unknown, expiresAt: number | undefined): Row {
+    return {
+        revision: revision as string,
+        json: JSON.stringify(document),
+        ...(expiresAt !== undefined && { expiresAt }),
+    }
+}
+
+function readRow(key: string, row: Row) {
+    return {
+        key,
+        revision: row.revision,
+        document: JSON.parse(row.json) as unknown,
+        ...(row.expiresAt !== undefined && { expiresAt: row.expiresAt }),
+    }
+}
+
+function isLive(row: Row | undefined, now: number): row is Row {
+    return row !== undefined && (row.expiresAt === undefined || now < row.expiresAt)
+}
+
+function hasRevision(row: Row | undefined, revision: unknown, now: number) {
+    return isLive(row, now) && row.revision === revision
 }
 
 function sortedByKey(rows: Map<string, Row>) {
@@ -320,16 +347,4 @@ class MapWithDefault<K, V> {
     entries() {
         return this.#map.entries()
     }
-}
-
-function conflict() {
-    const e = new Error('Conflict')
-    ;(e as unknown as { status: number }).status = 409
-    return e
-}
-
-function notFound() {
-    const e = new Error('Not found')
-    ;(e as unknown as { status: number }).status = 404
-    return e
 }

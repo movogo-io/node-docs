@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import type { Connection, TransactionItem } from './driver.js'
+import { conflict, isNotFound } from './errors.js'
+import { expiryOf, getUnexpired } from './expiry.js'
 import { maxTransactionItems } from './transaction.js'
 
 // Separates the index key value from the owning row's partition and key in the
@@ -91,10 +93,162 @@ export function assertClean(value: string, what: string) {
     }
 }
 
+type Add = Extract<TransactionItem, { op: 'add' }>
+type Update = Extract<TransactionItem, { op: 'update' }>
+type Delete = Extract<TransactionItem, { op: 'delete' }>
+
+export async function addWithIndexes(
+    c: Connection,
+    table: string,
+    partition: string,
+    key: string,
+    document: StoredDocument,
+    now: number,
+    leftover?: IndexEntry[],
+): Promise<Revision> {
+    const expiry = expiryOf(table, document)
+    if (!hasIndexes(table)) {
+        return await c.add(table, partition, key, document, { now, ...expiry })
+    }
+    const item: Add = {
+        op: 'add',
+        table,
+        partition,
+        key,
+        document,
+        newRevision: randomUUID(),
+        ...expiry,
+    }
+    await c.transact([item, ...(await addIndexItems(c, item, leftover))], { now })
+    return item.newRevision
+}
+
+export async function updateWithIndexes(
+    c: Connection,
+    table: string,
+    partition: string,
+    key: string,
+    revision: Revision,
+    document: StoredDocument,
+    now: number,
+    oldEntries?: IndexEntry[],
+): Promise<Revision> {
+    const expiry = expiryOf(table, document)
+    if (!hasIndexes(table)) {
+        return await c.update(table, partition, key, revision, document, { now, ...expiry })
+    }
+    const item: Update = {
+        op: 'update',
+        table,
+        partition,
+        key,
+        revision,
+        document,
+        newRevision: randomUUID(),
+        ...expiry,
+    }
+    await c.transact([item, ...(await updateIndexItems(c, item, now, oldEntries))], { now })
+    return item.newRevision
+}
+
+export async function deleteWithIndexes(
+    c: Connection,
+    table: string,
+    partition: string,
+    key: string,
+    revision: Revision,
+    now: number,
+): Promise<void> {
+    if (!hasIndexes(table)) {
+        await c.delete(table, partition, key, revision, { now })
+        return
+    }
+    const item: Delete = { op: 'delete', table, partition, key, revision }
+    await c.transact([item, ...(await deleteIndexItems(c, item, now))], { now })
+}
+
+export async function expandIndexOperations(
+    c: Connection,
+    items: TransactionItem[],
+    now: number,
+): Promise<TransactionItem[]> {
+    if (items.every(item => !hasIndexes(item.table))) {
+        return items
+    }
+    const expanded = await Promise.all(
+        items.map(async (item): Promise<TransactionItem[]> => {
+            if (!hasIndexes(item.table)) {
+                return [item]
+            }
+            switch (item.op) {
+                case 'add':
+                    return [item, ...(await addIndexItems(c, item))]
+                case 'update':
+                    return [item, ...(await updateIndexItems(c, item, now))]
+                case 'delete':
+                    return [item, ...(await deleteIndexItems(c, item, now))]
+                default:
+                    return [item]
+            }
+        }),
+    )
+    const flat = expanded.flat()
+    if (flat.length > maxTransactionItems) {
+        throw new Error(
+            `Transaction cannot contain more than ${String(maxTransactionItems)} operations; ` +
+                `${String(items.length)} requested operations expanded to ${String(flat.length)} including index maintenance.`,
+        )
+    }
+    return flat
+}
+
+async function addIndexItems(
+    c: Connection,
+    item: Add,
+    leftover?: IndexEntry[],
+): Promise<TransactionItem[]> {
+    const entries = indexEntriesOf(item.table, item.partition, item.key, item.document)
+    return [
+        ...putItems(entries, item.document, item.newRevision, item.expiresAt),
+        ...clearItems(leftover ?? (await leftoverEntries(c, item)), entries),
+    ]
+}
+
+async function updateIndexItems(
+    c: Connection,
+    item: Update,
+    now: number,
+    oldEntries?: IndexEntry[],
+): Promise<TransactionItem[]> {
+    const old =
+        oldEntries ??
+        indexEntriesOf(
+            item.table,
+            item.partition,
+            item.key,
+            (await existingRow(c, item, now)).document,
+        )
+    const entries = indexEntriesOf(item.table, item.partition, item.key, item.document)
+    return [
+        ...putItems(entries, item.document, item.newRevision, item.expiresAt),
+        ...clearItems(old, entries),
+    ]
+}
+
+async function deleteIndexItems(
+    c: Connection,
+    item: Delete,
+    now: number,
+): Promise<TransactionItem[]> {
+    const old = await existingRow(c, item, now)
+    return clearItems(indexEntriesOf(item.table, item.partition, item.key, old.document), [])
+}
+
 function putItems(
     entries: IndexEntry[],
     document: StoredDocument,
     newRevision: Revision,
+    expiresAt: number | undefined,
 ): TransactionItem[] {
     return entries.map(entry => ({
         op: 'put',
@@ -103,6 +257,7 @@ function putItems(
         key: entry.key,
         document,
         newRevision,
+        ...(expiresAt !== undefined && { expiresAt }),
     }))
 }
 
@@ -122,175 +277,46 @@ function entryId(entry: IndexEntry) {
     return JSON.stringify([entry.table, entry.partition, entry.key])
 }
 
-export async function addWithIndexes(
-    c: Connection,
+// The entries an expired document under the same key left behind. A live one
+// makes the add conflict, so its entries are never cleared.
+export function leftoverEntriesOf(
     table: string,
     partition: string,
     key: string,
-    document: StoredDocument,
-): Promise<Revision> {
-    if (!hasIndexes(table)) {
-        return await c.add(table, partition, key, document)
+    expired: { document: StoredDocument } | undefined,
+) {
+    if (!expired) {
+        return []
     }
-    const newRevision: Revision = randomUUID()
-    await c.transact([
-        { op: 'add', table, partition, key, document, newRevision },
-        ...putItems(indexEntriesOf(table, partition, key, document), document, newRevision),
-    ])
-    return newRevision
+    return indexEntriesOf(table, partition, key, expired.document)
 }
 
-export async function updateWithIndexes(
-    c: Connection,
-    table: string,
-    partition: string,
-    key: string,
-    revision: Revision,
-    document: StoredDocument,
-    oldEntries?: IndexEntry[],
-): Promise<Revision> {
-    if (!hasIndexes(table)) {
-        return await c.update(table, partition, key, revision, document)
+async function leftoverEntries(c: Connection, item: Add) {
+    try {
+        const { document } = await c.get(item.table, item.partition, item.key)
+        return indexEntriesOf(item.table, item.partition, item.key, document)
+    } catch (e) {
+        if (isNotFound(e)) {
+            return []
+        }
+        throw e
     }
-    const old =
-        oldEntries ??
-        indexEntriesOf(
-            table,
-            partition,
-            key,
-            (await existingRow(c, table, partition, key, revision)).document,
-        )
-    const newEntries = indexEntriesOf(table, partition, key, document)
-    const newRevision: Revision = randomUUID()
-    await c.transact([
-        { op: 'update', table, partition, key, revision, document, newRevision },
-        ...putItems(newEntries, document, newRevision),
-        ...clearItems(old, newEntries),
-    ])
-    return newRevision
-}
-
-export async function deleteWithIndexes(
-    c: Connection,
-    table: string,
-    partition: string,
-    key: string,
-    revision: Revision,
-): Promise<void> {
-    if (!hasIndexes(table)) {
-        await c.delete(table, partition, key, revision)
-        return
-    }
-    const old = await existingRow(c, table, partition, key, revision)
-    await c.transact([
-        { op: 'delete', table, partition, key, revision },
-        ...clearItems(indexEntriesOf(table, partition, key, old.document), []),
-    ])
-}
-
-export async function expandIndexOperations(
-    c: Connection,
-    items: TransactionItem[],
-): Promise<TransactionItem[]> {
-    if (items.every(item => !hasIndexes(item.table))) {
-        return items
-    }
-    const expanded = await Promise.all(
-        items.map(async (item): Promise<TransactionItem[]> => {
-            if (!hasIndexes(item.table)) {
-                return [item]
-            }
-            switch (item.op) {
-                case 'add':
-                    return [
-                        item,
-                        ...putItems(
-                            indexEntriesOf(item.table, item.partition, item.key, item.document),
-                            item.document,
-                            item.newRevision,
-                        ),
-                    ]
-                case 'update': {
-                    const old = await existingRow(
-                        c,
-                        item.table,
-                        item.partition,
-                        item.key,
-                        item.revision,
-                    )
-                    const oldEntries = indexEntriesOf(
-                        item.table,
-                        item.partition,
-                        item.key,
-                        old.document,
-                    )
-                    const newEntries = indexEntriesOf(
-                        item.table,
-                        item.partition,
-                        item.key,
-                        item.document,
-                    )
-                    return [
-                        item,
-                        ...putItems(newEntries, item.document, item.newRevision),
-                        ...clearItems(oldEntries, newEntries),
-                    ]
-                }
-                case 'delete': {
-                    const old = await existingRow(
-                        c,
-                        item.table,
-                        item.partition,
-                        item.key,
-                        item.revision,
-                    )
-                    return [
-                        item,
-                        ...clearItems(
-                            indexEntriesOf(item.table, item.partition, item.key, old.document),
-                            [],
-                        ),
-                    ]
-                }
-                default:
-                    return [item]
-            }
-        }),
-    )
-    const flat = expanded.flat()
-    if (flat.length > maxTransactionItems) {
-        throw new Error(
-            `Transaction cannot contain more than ${String(maxTransactionItems)} operations; ` +
-                `${String(items.length)} requested operations expanded to ${String(flat.length)} including index maintenance.`,
-        )
-    }
-    return flat
 }
 
 async function existingRow(
     c: Connection,
-    table: string,
-    partition: string,
-    key: string,
-    revision: Revision,
+    item: { table: string; partition: string; key: string; revision: Revision },
+    now: number,
 ) {
-    let row
     try {
-        row = await c.get(table, partition, key)
-    } catch (e) {
-        if ((e as { status?: unknown }).status === 404) {
-            throw conflict()
+        const row = await getUnexpired(c, item.table, item.partition, item.key, now)
+        if (row.revision === item.revision) {
+            return row
         }
-        throw e
+    } catch (e) {
+        if (!isNotFound(e)) {
+            throw e
+        }
     }
-    if (row.revision !== revision) {
-        throw conflict()
-    }
-    return row
-}
-
-function conflict() {
-    const e = new Error('Conflict')
-    ;(e as unknown as { status: number }).status = 409
-    return e
+    throw conflict()
 }

@@ -78,16 +78,17 @@ function recording(label: string, seen: string[]) {
 function delegating(label: string, seen: string[], inner: Connection): Connection {
     return {
         close: () => inner.close(),
-        add: (table, partition, key, document) => {
+        add: (table, partition, key, document, options) => {
             seen.push(`${label} add ${table}`)
-            return inner.add(table, partition, key, document)
+            return inner.add(table, partition, key, document, options)
         },
         get: (table, partition, key) => inner.get(table, partition, key),
         getPartitions: table => inner.getPartitions(table),
         getPartition: (table, partition, range) => inner.getPartition(table, partition, range),
-        update: (table, partition, key, revision, document) =>
-            inner.update(table, partition, key, revision, document),
-        delete: (table, partition, key, revision) => inner.delete(table, partition, key, revision),
-        transact: items => inner.transact(items),
+        update: (table, partition, key, revision, document, options) =>
+            inner.update(table, partition, key, revision, document, options),
+        delete: (table, partition, key, revision, options) =>
+            inner.delete(table, partition, key, revision, options),
+        transact: (items, options) => inner.transact(items, options),
     }
 }

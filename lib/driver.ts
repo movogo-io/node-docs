@@ -6,6 +6,20 @@ export type Driver = {
     connect: (context: Context) => Promise<Connection>
 }
 
+// Times handed to drivers are integer epoch seconds. A row whose stored
+// `expiresAt` is at or before the `now` of the operation is expired: `add` and
+// `put` overwrite it as if it were missing, while `update`, `delete`, and
+// `check` conflict on it. `put` and `clear` ignore `now`.
+//
+// Writes omit `expiresAt` for a row that never expires, and an `update` or
+// `put` without it clears any stored expiry. Any integer is a valid expiry,
+// negative or far in the future; drivers store it rather than reject it.
+//
+// Reads return rows raw, expired or not, with their stored `expiresAt`; a row
+// without one comes back without the key, never with `expiresAt: undefined`.
+// The store filters. Drivers may delete expired rows at any time and then
+// report them missing on read, and `getPartitions` may list partitions whose
+// only rows have expired.
 export type TransactionItem =
     | {
           op: 'add'
@@ -14,6 +28,7 @@ export type TransactionItem =
           key: string
           document: StoredDocument
           newRevision: Revision
+          expiresAt?: number
       }
     | {
           op: 'update'
@@ -23,6 +38,7 @@ export type TransactionItem =
           revision: Revision
           document: StoredDocument
           newRevision: Revision
+          expiresAt?: number
       }
     | {
           op: 'delete'
@@ -45,6 +61,7 @@ export type TransactionItem =
           key: string
           document: StoredDocument
           newRevision: Revision
+          expiresAt?: number
       }
     | {
           op: 'clear'
@@ -60,27 +77,40 @@ export type Connection = {
         partition: string,
         key: string,
         document: StoredDocument,
+        options: { now: number; expiresAt?: number },
     ) => Promise<Revision>
     get: (
         table: string,
         partition: string,
         key: string,
-    ) => Promise<Row<StoredDocument> & { partition: string; key: string }>
+    ) => Promise<Row<StoredDocument> & { partition: string; key: string; expiresAt?: number }>
     getPartitions: (table: string) => AsyncIterable<string>
     getPartition: (
         table: string,
         partition: string,
         keyRange?: KeyRange,
-    ) => AsyncIterable<{ key: string; revision: Revision; document: StoredDocument }>
+    ) => AsyncIterable<{
+        key: string
+        revision: Revision
+        document: StoredDocument
+        expiresAt?: number
+    }>
     update: (
         table: string,
         partition: string,
         key: string,
         revision: Revision,
         document: StoredDocument,
+        options: { now: number; expiresAt?: number },
     ) => Promise<Revision>
-    delete: (table: string, partition: string, key: string, revision: Revision) => Promise<void>
-    transact: (items: TransactionItem[]) => Promise<void>
+    delete: (
+        table: string,
+        partition: string,
+        key: string,
+        revision: Revision,
+        options: { now: number },
+    ) => Promise<void>
+    transact: (items: TransactionItem[], options: { now: number }) => Promise<void>
 }
 
 const state: {

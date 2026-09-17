@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import type { TransactionItem } from './driver.js'
+import { expiryOf } from './expiry.js'
 
 export const maxTransactionItems = 100
 
@@ -9,34 +10,41 @@ export class TransactionBuffer {
     readonly #touched = new Set<string>()
     #sealed = false
 
-    add(table: string, partition: string, key: string, document: StoredDocument) {
+    async add(table: string, partition: string, key: string, document: StoredDocument) {
+        const expiry = expiryOf(table, document)
         const newRevision: Revision = randomUUID()
-        return this.#enqueue(
-            { op: 'add', table, partition, key, document, newRevision },
-            newRevision,
-        )
+        await this.#enqueue({ op: 'add', table, partition, key, document, newRevision, ...expiry })
+        return newRevision
     }
 
-    update(
+    async update(
         table: string,
         partition: string,
         key: string,
         revision: Revision,
         document: StoredDocument,
     ) {
+        const expiry = expiryOf(table, document)
         const newRevision: Revision = randomUUID()
-        return this.#enqueue(
-            { op: 'update', table, partition, key, revision, document, newRevision },
+        await this.#enqueue({
+            op: 'update',
+            table,
+            partition,
+            key,
+            revision,
+            document,
             newRevision,
-        )
+            ...expiry,
+        })
+        return newRevision
     }
 
-    check(table: string, partition: string, key: string, revision: Revision) {
-        return this.#enqueue({ op: 'check', table, partition, key, revision }, undefined)
+    async check(table: string, partition: string, key: string, revision: Revision) {
+        await this.#enqueue({ op: 'check', table, partition, key, revision })
     }
 
-    delete(table: string, partition: string, key: string, revision: Revision) {
-        return this.#enqueue({ op: 'delete', table, partition, key, revision }, undefined)
+    async delete(table: string, partition: string, key: string, revision: Revision) {
+        await this.#enqueue({ op: 'delete', table, partition, key, revision })
     }
 
     seal() {
@@ -44,27 +52,24 @@ export class TransactionBuffer {
         return this.#items
     }
 
-    #enqueue<T>(item: TransactionItem, result: T) {
-        if (this.#sealed) {
-            return Promise.reject(new Error('Transaction has already been committed.'))
-        }
-        const id = JSON.stringify([item.table, item.partition, item.key])
-        if (this.#touched.has(id)) {
-            return Promise.reject(
-                new Error(
+    #enqueue(item: TransactionItem) {
+        return Promise.try(() => {
+            if (this.#sealed) {
+                throw new Error('Transaction has already been committed.')
+            }
+            const id = JSON.stringify([item.table, item.partition, item.key])
+            if (this.#touched.has(id)) {
+                throw new Error(
                     `Transaction already contains an operation on '${item.key}' in partition '${item.partition}' of table '${item.table}'.`,
-                ),
-            )
-        }
-        if (this.#items.length === maxTransactionItems) {
-            return Promise.reject(
-                new Error(
+                )
+            }
+            if (this.#items.length === maxTransactionItems) {
+                throw new Error(
                     `Transaction cannot contain more than ${String(maxTransactionItems)} operations.`,
-                ),
-            )
-        }
-        this.#touched.add(id)
-        this.#items.push(item)
-        return Promise.resolve(result)
+                )
+            }
+            this.#touched.add(id)
+            this.#items.push(item)
+        })
     }
 }

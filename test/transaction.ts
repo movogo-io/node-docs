@@ -175,9 +175,9 @@ describe('transactions', () => {
         setDriver({
             connect: async () => {
                 const c = await inner.connect()
-                return spyConnection(c, items => {
+                return spyConnection(c, (items, options) => {
                     ++calls
-                    return c.transact(items)
+                    return c.transact(items, options)
                 })
             },
         })
@@ -231,9 +231,9 @@ describe('transactions', () => {
         await withTransaction(context, () => Promise.resolve())
 
         const c = await driver.connect()
-        await c.add('T', 'p', 'k', { data: 'x' })
+        await c.add('T', 'p', 'k', { data: 'x' }, { now: 0 })
         await context[Symbol.asyncDispose]()
-        await assert.rejects(c.add('T', 'p', 'k2', { data: 'y' }), /closed/u)
+        await assert.rejects(c.add('T', 'p', 'k2', { data: 'y' }, { now: 0 }), /closed/u)
     })
 })
 
@@ -260,17 +260,19 @@ function setMemoryDriver() {
 
 function spyConnection(
     c: Connection,
-    transact: (items: TransactionItem[]) => Promise<void>,
+    transact: (items: TransactionItem[], options: { now: number }) => Promise<void>,
 ): Connection {
     return {
         close: () => c.close(),
-        add: (table, partition, key, document) => c.add(table, partition, key, document),
+        add: (table, partition, key, document, options) =>
+            c.add(table, partition, key, document, options),
         get: (table, partition, key) => c.get(table, partition, key),
         getPartitions: table => c.getPartitions(table),
         getPartition: (table, partition, range) => c.getPartition(table, partition, range),
-        update: (table, partition, key, revision, document) =>
-            c.update(table, partition, key, revision, document),
-        delete: (table, partition, key, revision) => c.delete(table, partition, key, revision),
+        update: (table, partition, key, revision, document, options) =>
+            c.update(table, partition, key, revision, document, options),
+        delete: (table, partition, key, revision, options) =>
+            c.delete(table, partition, key, revision, options),
         transact,
     }
 }

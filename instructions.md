@@ -105,7 +105,7 @@ type DocumentSet<Document> = {
 type Row<Document> = { key: string; revision: Revision; document: Document };
 ```
 
-Each table also exposes `getPartitions()`, an async iterable of the partition keys currently holding documents. In DynamoDB that is a full-table scan whose cost grows with everything ever stored, so reserve it for sweeps and migrations and never call it from a request handler.
+Each table also exposes `getPartitions()`, an async iterable of the partition keys currently holding documents (expired ones included until the driver removes them). In DynamoDB that is a full-table scan whose cost grows with everything ever stored, so reserve it for sweeps and migrations and never call it from a request handler.
 
 Consider adding helper functions to `./lib/schema.ts` like this
 
@@ -259,8 +259,43 @@ Rules and properties:
 - **Index rows carry the document and its revision.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`.
 - **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table.
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
-- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `update` or `delete` additionally reads the current document first, to find the entries to remove, unless it runs through a retry helper that has already read it. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
+- **Extractors must handle every document shape ever stored.** A write computes the entries of the document it replaces, including an expired one under the same key, so an extractor that throws on a legacy shape makes `add`, `update`, and `delete` of that key fail.
+- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
 - **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
+
+## Expiry
+
+A table can declare that its documents **expire**: a point in time computed from each document after which the document is gone. Use it for holds, one-time codes, OAuth states, idempotency records, and other rows that are only meaningful for a while — a table declaring expiry needs no sweeper.
+
+Declare expiry once, next to the schema in `./lib/schema.ts`, through the `docs` handle:
+
+```ts
+import { docs } from "@movogo-io/docs/indexed";
+
+const schema = docs<Schema>();
+
+// Documents are stored as JSON, so a date field comes back as a string or a
+// number: always construct the Date in the extractor, and return undefined
+// for documents that do not expire — including legacy ones lacking the field.
+schema.expiry("Holds", (hold) => {
+    if (hold.expiresAt === undefined) {
+        return undefined;
+    }
+    return new Date(hold.expiresAt);
+});
+```
+
+The extractor receives the typed document and returns a `Date`, or `undefined` for a document that does not expire. It runs on every write, and only on writes, so it must be pure and must not throw. Any other result — including an invalid `Date` — rejects the write, so a broken extractor is caught by the service's own tests under the memory driver.
+
+Rules and properties:
+
+- **At most one expiry per table, declared before the first write.** A second declaration for the same table throws. Writes consult the declaration, so `schema.expiry` must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
+- **Expiry is second-granular.** A document is expired from the start of the second containing its expiry instant.
+- **An expired document is invisible to every operation, under every driver.** `get` and `getDocument` throw not found; `getAll`, `getRange`, and index lookups skip it; reads inside `withTransaction` behave the same; `add` replaces it as if it were absent, so `getOrAdd`, `addOrUpdate`, and `converge` add a fresh document over an expired one; `update`, `delete`, and `check` conflict, like on a deleted document: re-read, find nothing, add fresh.
+- **Drivers remove expired rows lazily.** The store hands every driver the expiry explicitly; the DynamoDB driver stores it in the table's time-to-live attribute and leaves the deletion to DynamoDB. Nothing may rely on an expired row still existing, and nothing needs to remove it — though `getPartitions()` may list partitions whose only documents are expired but not yet removed.
+- **The clock comes from the context.** When the context has a `now()` function — every @riddance/service context does — the store reads the time from it, so tests can move the clock instead of sleeping. Without one the wall clock is used. A `now()` returning an invalid `Date` fails the operation.
+- **The stored expiry is what counts.** Reads never run the extractor: a document written before the declaration, or under a previous extractor, keeps its stored expiry (or none) until it is rewritten, so it stays visible and never expires until an update stores a new expiry. Changing an extractor therefore needs a backfill that rewrites each row, exactly like changing an index.
+- **Expiry needs a driver implementing the 0.2 connection contract.** An older driver ignores it, so rows never expire in storage and adds over expired rows conflict.
 
 ## Driver Decoration
 

@@ -1,18 +1,22 @@
 import assert from 'node:assert/strict'
 import { setTimeout } from 'node:timers/promises'
-import { getDriver, type Connection } from './lib/driver.js'
+import { isConflict } from './lib/errors.js'
+import { getRow, getUnexpired, unexpired } from './lib/expiry.js'
 import {
     addWithIndexes,
     deleteWithIndexes,
     expandIndexOperations,
     indexEntriesOf,
+    leftoverEntriesOf,
     updateWithIndexes,
 } from './lib/indexes.js'
+import { openSession, type Session } from './lib/session.js'
 import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
-type Context = {
+export type Context = {
     on?: (event: 'free', handler: () => Promise<void>) => boolean
+    now?: () => Date
 }
 
 type TableNamesOf<Schema> = keyof Schema & string
@@ -122,6 +126,18 @@ type FixedKey<Document> = {
         revision: Revision
         document: Document
     }>
+    convergeComputed: (
+        partition: string,
+        target: (document: Document) => boolean,
+        computed: () => Promise<Document> | Document,
+        update: (existing: Document) => Document | void,
+        options?: RetryOptions,
+    ) => Promise<{
+        partition: Revision
+        key: string
+        revision: Revision
+        document: Document
+    }>
     delete: (partition: string, revision: Revision) => Promise<void>
 }
 
@@ -181,6 +197,18 @@ type NamedPartition<Document> = {
         revision: Revision
         document: Document
     }>
+    convergeComputed: (
+        key: string,
+        target: (document: Document) => boolean,
+        computed: () => Promise<Document> | Document,
+        update: (existing: Document) => Document | void,
+        options?: RetryOptions,
+    ) => Promise<{
+        partition: Revision
+        key: string
+        revision: Revision
+        document: Document
+    }>
     delete: (key: string, revision: Revision) => Promise<void>
 }
 
@@ -200,13 +228,12 @@ export function tables<Schema = GenericSchema>(
 ): Tables<Schema>
 
 export function tables<Schema = GenericSchema>(context: Context) {
-    const d = getDriver()
-    const connection = d.connect(context)
+    const session = openSession(context)
     const closer = async () => {
-        const c = await connection
+        const c = await session.connection
         await c.close()
     }
-    const p = new Proxy(tablesBase(connection), tablesProxy) as unknown as Tables<Schema>
+    const p = new Proxy(tablesBase(session), tablesProxy) as unknown as Tables<Schema>
     if (!context.on?.('free', closer)) {
         const dp = p as Tables<Schema> & AsyncDisposable
         dp[Symbol.asyncDispose] = closer
@@ -214,12 +241,12 @@ export function tables<Schema = GenericSchema>(context: Context) {
     return p
 }
 
-const connectionEntry = Symbol()
+const sessionEntry = Symbol()
 const tableNameEntry = Symbol()
 
-function tablesBase(connection: Promise<Connection>) {
+function tablesBase(session: Session) {
     return {
-        [connectionEntry]: connection,
+        [sessionEntry]: session,
     }
 }
 
@@ -244,33 +271,49 @@ const tablesProxy = facadeProxy((target: ReturnType<typeof tablesBase>, table) =
 })
 
 function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
+    const session = db[sessionEntry]
     return {
-        [connectionEntry]: db[connectionEntry],
+        [sessionEntry]: session,
         [tableNameEntry]: table,
         withKey: (key: string) => ({
             async add(partition: string, document: unknown) {
-                const c = await db[connectionEntry]
-                return await addWithIndexes(c, table, partition, key, document)
+                const c = await session.connection
+                return await addWithIndexes(
+                    c,
+                    table,
+                    partition,
+                    key,
+                    document,
+                    session.nowSeconds(),
+                )
             },
             async get(partition: string) {
-                const c = await db[connectionEntry]
-                return await c.get(table, partition, key)
+                const c = await session.connection
+                return await getUnexpired(c, table, partition, key, session.nowSeconds())
             },
             async getDocument(partition: string) {
-                const c = await db[connectionEntry]
-                const r = await c.get(table, partition, key)
+                const c = await session.connection
+                const r = await getUnexpired(c, table, partition, key, session.nowSeconds())
                 return r.document
             },
             async update(partition: string, revision: Revision, document: StoredDocument) {
-                const c = await db[connectionEntry]
-                return await updateWithIndexes(c, table, partition, key, revision, document)
+                const c = await session.connection
+                return await updateWithIndexes(
+                    c,
+                    table,
+                    partition,
+                    key,
+                    revision,
+                    document,
+                    session.nowSeconds(),
+                )
             },
             async updateRow(row: {
                 partition: string
                 revision: Revision
                 document: StoredDocument
             }) {
-                const c = await db[connectionEntry]
+                const c = await session.connection
                 return await updateWithIndexes(
                     c,
                     table,
@@ -278,66 +321,53 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                     key,
                     row.revision,
                     row.document,
+                    session.nowSeconds(),
                 )
             },
-            async getOrAdd(partition: string, document: unknown, options?: RetryOptions) {
-                const c = await db[connectionEntry]
-                return await getOrAdd(c, table, partition, key, document, options)
-            },
-            async getOrAddComputed<T>(
+            getOrAdd: async (partition: string, document: unknown, options?: RetryOptions) =>
+                await getOrAdd(session, table, partition, key, document, options),
+            getOrAddComputed: async <T>(
                 partition: string,
                 computed: () => Promise<T> | T,
                 options?: RetryOptions,
-            ) {
-                const c = await db[connectionEntry]
-                return await getOrAddComputed(c, table, partition, key, computed, options)
-            },
-            async addOrUpdate(
+            ) => await getOrAddComputed(session, table, partition, key, computed, options),
+            addOrUpdate: async (
                 partition: string,
                 document: unknown,
                 update: (existing: unknown) => unknown,
                 options?: RetryOptions,
-            ) {
-                const c = await db[connectionEntry]
-                return await addOrUpdate(c, table, partition, key, document, update, options)
-            },
-            async addOrUpdateComputed<T>(
+            ) => await addOrUpdate(session, table, partition, key, document, update, options),
+            addOrUpdateComputed: async <T>(
                 partition: string,
                 computed: () => Promise<T> | T,
                 update: (existing: T) => T | void,
                 options?: RetryOptions,
-            ) {
-                const c = await db[connectionEntry]
-                return await addOrUpdateComputed(
-                    c,
+            ) =>
+                await addOrUpdateComputed(
+                    session,
                     table,
                     partition,
                     key,
                     computed,
                     update,
                     options,
-                )
-            },
-            async converge<T>(
+                ),
+            converge: async <T>(
                 partition: string,
                 target: (document: T) => boolean,
                 initial: T,
                 update: (existing: T) => T | void,
                 options?: RetryOptions,
-            ) {
-                const c = await db[connectionEntry]
-                return await converge(c, table, partition, key, target, initial, update, options)
-            },
-            async convergeComputed<T>(
+            ) => await converge(session, table, partition, key, target, initial, update, options),
+            convergeComputed: async <T>(
                 partition: string,
                 target: (document: T) => boolean,
                 computed: () => Promise<T> | T,
                 update: (existing: T) => T | void,
                 options?: RetryOptions,
-            ) {
-                const c = await db[connectionEntry]
-                return await convergeComputed(
-                    c,
+            ) =>
+                await convergeComputed(
+                    session,
                     table,
                     partition,
                     key,
@@ -345,16 +375,15 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                     computed,
                     update,
                     options,
-                )
-            },
+                ),
             async delete(partition: string, revision: Revision) {
-                const c = await db[connectionEntry]
-                await deleteWithIndexes(c, table, partition, key, revision)
+                const c = await session.connection
+                await deleteWithIndexes(c, table, partition, key, revision, session.nowSeconds())
             },
         }),
-        partition: (partition: string) => new Partition(db[connectionEntry], table, partition),
+        partition: (partition: string) => new Partition(session, table, partition),
         async *getPartitions() {
-            const c = await db[connectionEntry]
+            const c = await session.connection
             for await (const partition of c.getPartitions(table)) {
                 yield partition
             }
@@ -363,50 +392,64 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
 }
 
 const tableProxy = facadeProxy((target: ReturnType<typeof tableBase>, partition) => {
-    return new Partition(target[connectionEntry], target[tableNameEntry], partition)
+    return new Partition(target[sessionEntry], target[tableNameEntry], partition)
 })
 
 class Partition {
-    readonly #connection
+    readonly #session
     readonly #table
     readonly #partition
 
-    constructor(connection: Promise<Connection>, table: string, partition: string) {
-        this.#connection = connection
+    constructor(session: Session, table: string, partition: string) {
+        this.#session = session
         this.#table = table
         this.#partition = partition
     }
 
     async add(key: string, document: StoredDocument) {
-        const c = await this.#connection
-        return await addWithIndexes(c, this.#table, this.#partition, key, document)
+        const c = await this.#session.connection
+        return await addWithIndexes(
+            c,
+            this.#table,
+            this.#partition,
+            key,
+            document,
+            this.#session.nowSeconds(),
+        )
     }
     async get(key: string) {
-        const c = await this.#connection
-        return c.get(this.#table, this.#partition, key)
+        const c = await this.#session.connection
+        return await getUnexpired(c, this.#table, this.#partition, key, this.#session.nowSeconds())
     }
     async getDocument(key: string) {
         const r = await this.get(key)
         return r.document
     }
     async *getAll() {
-        const c = await this.#connection
-        for await (const r of c.getPartition(this.#table, this.#partition)) {
-            yield r
-        }
+        const c = await this.#session.connection
+        yield* unexpired(c.getPartition(this.#table, this.#partition), this.#session.nowSeconds())
     }
     async *getRange(range: KeyRange) {
-        const c = await this.#connection
-        for await (const r of c.getPartition(this.#table, this.#partition, range)) {
-            yield r
-        }
+        const c = await this.#session.connection
+        yield* unexpired(
+            c.getPartition(this.#table, this.#partition, range),
+            this.#session.nowSeconds(),
+        )
     }
     async update(key: string, revision: Revision, document: StoredDocument) {
-        const c = await this.#connection
-        return await updateWithIndexes(c, this.#table, this.#partition, key, revision, document)
+        const c = await this.#session.connection
+        return await updateWithIndexes(
+            c,
+            this.#table,
+            this.#partition,
+            key,
+            revision,
+            document,
+            this.#session.nowSeconds(),
+        )
     }
     async updateRow(row: { key: string; revision: Revision; document: StoredDocument }) {
-        const c = await this.#connection
+        const c = await this.#session.connection
         return await updateWithIndexes(
             c,
             this.#table,
@@ -414,15 +457,21 @@ class Partition {
             row.key,
             row.revision,
             row.document,
+            this.#session.nowSeconds(),
         )
     }
     async getOrAdd(key: string, document: unknown, options?: RetryOptions) {
-        const c = await this.#connection
-        return await getOrAdd(c, this.#table, this.#partition, key, document, options)
+        return await getOrAdd(this.#session, this.#table, this.#partition, key, document, options)
     }
     async getOrAddComputed(key: string, computed: () => Promise<unknown>, options?: RetryOptions) {
-        const c = await this.#connection
-        return await getOrAddComputed(c, this.#table, this.#partition, key, computed, options)
+        return await getOrAddComputed(
+            this.#session,
+            this.#table,
+            this.#partition,
+            key,
+            computed,
+            options,
+        )
     }
     async addOrUpdate(
         key: string,
@@ -430,8 +479,15 @@ class Partition {
         update: (existing: unknown) => unknown,
         options?: RetryOptions,
     ) {
-        const c = await this.#connection
-        return await addOrUpdate(c, this.#table, this.#partition, key, document, update, options)
+        return await addOrUpdate(
+            this.#session,
+            this.#table,
+            this.#partition,
+            key,
+            document,
+            update,
+            options,
+        )
     }
     async addOrUpdateComputed(
         key: string,
@@ -439,9 +495,8 @@ class Partition {
         update: (existing: unknown) => unknown,
         options?: RetryOptions,
     ) {
-        const c = await this.#connection
         return await addOrUpdateComputed(
-            c,
+            this.#session,
             this.#table,
             this.#partition,
             key,
@@ -457,9 +512,8 @@ class Partition {
         update: (existing: T) => T | void,
         options?: RetryOptions,
     ) {
-        const c = await this.#connection
         return await converge(
-            c,
+            this.#session,
             this.#table,
             this.#partition,
             key,
@@ -477,9 +531,8 @@ class Partition {
         update: (existing: T) => T | void,
         options?: RetryOptions,
     ) {
-        const c = await this.#connection
         return await convergeComputed(
-            c,
+            this.#session,
             this.#table,
             this.#partition,
             key,
@@ -490,8 +543,15 @@ class Partition {
         )
     }
     async delete(key: string, revision: Revision) {
-        const c = await this.#connection
-        await deleteWithIndexes(c, this.#table, this.#partition, key, revision)
+        const c = await this.#session.connection
+        await deleteWithIndexes(
+            c,
+            this.#table,
+            this.#partition,
+            key,
+            revision,
+            this.#session.nowSeconds(),
+        )
     }
 }
 
@@ -560,25 +620,25 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
     fn: (tx: TransactionTables<Schema>) => Promise<T>,
     options?: RetryOptions,
 ): Promise<T> {
-    const d = getDriver()
-    const connection = d.connect(context)
+    const session = openSession(context)
     const closer = async () => {
-        const c = await connection
+        const c = await session.connection
         await c.close()
     }
     const registered = context.on?.('free', closer) ?? false
     try {
-        const c = await connection
+        const c = await session.connection
         return await retryConflict(async () => {
             const buffer = new TransactionBuffer()
             const tx = new Proxy(
-                transactionTablesBase(connection, buffer),
+                transactionTablesBase(session, buffer),
                 transactionTablesProxy,
             ) as unknown as TransactionTables<Schema>
             const result = await fn(tx)
-            const items = await expandIndexOperations(c, buffer.seal())
+            const now = session.nowSeconds()
+            const items = await expandIndexOperations(c, buffer.seal(), now)
             if (items.length !== 0) {
-                await c.transact(items)
+                await c.transact(items, { now })
             }
             return result
         }, options)
@@ -591,9 +651,9 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
 
 const bufferEntry = Symbol()
 
-function transactionTablesBase(connection: Promise<Connection>, buffer: TransactionBuffer) {
+function transactionTablesBase(session: Session, buffer: TransactionBuffer) {
     return {
-        [connectionEntry]: connection,
+        [sessionEntry]: session,
         [bufferEntry]: buffer,
     }
 }
@@ -606,20 +666,20 @@ const transactionTablesProxy = facadeProxy(
 
 function transactionTableBase(db: ReturnType<typeof transactionTablesBase>, table: string) {
     return {
-        [connectionEntry]: db[connectionEntry],
+        [sessionEntry]: db[sessionEntry],
         [bufferEntry]: db[bufferEntry],
         [tableNameEntry]: table,
         withKey: (key: string) =>
-            new TransactionFixedKeySet(db[connectionEntry], db[bufferEntry], table, key),
+            new TransactionFixedKeySet(db[sessionEntry], db[bufferEntry], table, key),
         partition: (partition: string) =>
-            new TransactionPartition(db[connectionEntry], db[bufferEntry], table, partition),
+            new TransactionPartition(db[sessionEntry], db[bufferEntry], table, partition),
     }
 }
 
 const transactionTableProxy = facadeProxy(
     (target: ReturnType<typeof transactionTableBase>, partition) => {
         return new TransactionPartition(
-            target[connectionEntry],
+            target[sessionEntry],
             target[bufferEntry],
             target[tableNameEntry],
             partition,
@@ -633,13 +693,8 @@ class TransactionPartition {
     readonly #table
     readonly #partition
 
-    constructor(
-        connection: Promise<Connection>,
-        buffer: TransactionBuffer,
-        table: string,
-        partition: string,
-    ) {
-        this.#reads = new Partition(connection, table, partition)
+    constructor(session: Session, buffer: TransactionBuffer, table: string, partition: string) {
+        this.#reads = new Partition(session, table, partition)
         this.#buffer = buffer
         this.#table = table
         this.#partition = partition
@@ -681,26 +736,21 @@ class TransactionPartition {
 }
 
 class TransactionFixedKeySet {
-    readonly #connection
+    readonly #session
     readonly #buffer
     readonly #table
     readonly #key
 
-    constructor(
-        connection: Promise<Connection>,
-        buffer: TransactionBuffer,
-        table: string,
-        key: string,
-    ) {
-        this.#connection = connection
+    constructor(session: Session, buffer: TransactionBuffer, table: string, key: string) {
+        this.#session = session
         this.#buffer = buffer
         this.#table = table
         this.#key = key
     }
 
     async get(partition: string) {
-        const c = await this.#connection
-        return await c.get(this.#table, partition, this.#key)
+        const c = await this.#session.connection
+        return await getUnexpired(c, this.#table, partition, this.#key, this.#session.nowSeconds())
     }
     async getDocument(partition: string) {
         const r = await this.get(partition)
@@ -733,7 +783,7 @@ export type RetryOptions = { retries?: number; delay?: number; signal?: AbortSig
 type Row = { partition: string; key: string; revision: unknown; document: unknown }
 
 async function getOrAdd(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -741,20 +791,20 @@ async function getOrAdd(
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
-        try {
-            return await c.get(table, partition, key)
-        } catch (e) {
-            if (isNotFound(e)) {
-                const revision = await addWithIndexes(c, table, partition, key, document)
-                return { partition, key, revision, document }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (live) {
+            return live
         }
+        const leftover = leftoverEntriesOf(table, partition, key, expired)
+        const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
+        return { partition, key, revision, document }
     }, options)
 }
 
 async function getOrAddComputed<T>(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -762,21 +812,21 @@ async function getOrAddComputed<T>(
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
-        try {
-            return await c.get(table, partition, key)
-        } catch (e) {
-            if (isNotFound(e)) {
-                const document = await callback()
-                const revision = await addWithIndexes(c, table, partition, key, document)
-                return { partition, key, revision, document }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (live) {
+            return live
         }
+        const document = await callback()
+        const leftover = leftoverEntriesOf(table, partition, key, expired)
+        const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
+        return { partition, key, revision, document }
     }, options)
 }
 
 async function addOrUpdate<T>(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -785,33 +835,32 @@ async function addOrUpdate<T>(
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
-        try {
-            const row = await c.get(table, partition, key)
-            const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            const returned = update(row.document as T)
-            const updated = returned ?? (row.document as T)
-            const revision = await updateWithIndexes(
-                c,
-                table,
-                partition,
-                key,
-                row.revision,
-                updated,
-                oldEntries,
-            )
-            return { action: 'update', partition, key, revision, document: updated }
-        } catch (e) {
-            if (isNotFound(e)) {
-                const revision = await addWithIndexes(c, table, partition, key, document)
-                return { action: 'add', partition, key, revision, document }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (!live) {
+            const leftover = leftoverEntriesOf(table, partition, key, expired)
+            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
+            return { action: 'add', partition, key, revision, document }
         }
+        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const updated = update(live.document as T) ?? (live.document as T)
+        const revision = await updateWithIndexes(
+            c,
+            table,
+            partition,
+            key,
+            live.revision,
+            updated,
+            now,
+            oldEntries,
+        )
+        return { action: 'update', partition, key, revision, document: updated }
     }, options)
 }
 
 async function addOrUpdateComputed<T>(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -820,34 +869,33 @@ async function addOrUpdateComputed<T>(
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
-        try {
-            const row = await c.get(table, partition, key)
-            const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            const returned = update(row.document as T)
-            const updated = returned ?? (row.document as T)
-            const revision = await updateWithIndexes(
-                c,
-                table,
-                partition,
-                key,
-                row.revision,
-                updated,
-                oldEntries,
-            )
-            return { action: 'update', partition, key, revision, document: updated }
-        } catch (e) {
-            if (isNotFound(e)) {
-                const document = await computed()
-                const revision = await addWithIndexes(c, table, partition, key, document)
-                return { action: 'add', partition, key, revision, document }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (!live) {
+            const document = await computed()
+            const leftover = leftoverEntriesOf(table, partition, key, expired)
+            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
+            return { action: 'add', partition, key, revision, document }
         }
+        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const updated = update(live.document as T) ?? (live.document as T)
+        const revision = await updateWithIndexes(
+            c,
+            table,
+            partition,
+            key,
+            live.revision,
+            updated,
+            now,
+            oldEntries,
+        )
+        return { action: 'update', partition, key, revision, document: updated }
     }, options)
 }
 
 async function converge<T>(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -858,37 +906,36 @@ async function converge<T>(
 ): Promise<Row> {
     assert.ok(target(initial), 'Initial document does not meet target.')
     return await retryConflict(async () => {
-        try {
-            const row = await c.get(table, partition, key)
-            if (target(row.document as T)) {
-                return row
-            }
-            const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            const returned = update(row.document as T)
-            const updated = returned ?? (row.document as T)
-            assert.ok(target(updated), 'Updated document does not meet target.')
-            const revision = await updateWithIndexes(
-                c,
-                table,
-                partition,
-                key,
-                row.revision,
-                updated,
-                oldEntries,
-            )
-            return { partition, key, revision, document: updated }
-        } catch (e) {
-            if (isNotFound(e)) {
-                const revision = await addWithIndexes(c, table, partition, key, initial)
-                return { partition, key, revision, document: initial }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (!live) {
+            const leftover = leftoverEntriesOf(table, partition, key, expired)
+            const revision = await addWithIndexes(c, table, partition, key, initial, now, leftover)
+            return { partition, key, revision, document: initial }
         }
+        if (target(live.document as T)) {
+            return live
+        }
+        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const updated = update(live.document as T) ?? (live.document as T)
+        assert.ok(target(updated), 'Updated document does not meet target.')
+        const revision = await updateWithIndexes(
+            c,
+            table,
+            partition,
+            key,
+            live.revision,
+            updated,
+            now,
+            oldEntries,
+        )
+        return { partition, key, revision, document: updated }
     }, options)
 }
 
 async function convergeComputed<T>(
-    c: Connection,
+    session: Session,
     table: string,
     partition: string,
     key: string,
@@ -898,34 +945,33 @@ async function convergeComputed<T>(
     options?: RetryOptions,
 ): Promise<Row> {
     return await retryConflict(async () => {
-        try {
-            const row = await c.get(table, partition, key)
-            if (target(row.document as T)) {
-                return row
-            }
-            const oldEntries = indexEntriesOf(table, partition, key, row.document)
-            const returned = update(row.document as T)
-            const updated = returned ?? (row.document as T)
-            assert.ok(target(updated), 'Updated document does not meet target.')
-            const revision = await updateWithIndexes(
-                c,
-                table,
-                partition,
-                key,
-                row.revision,
-                updated,
-                oldEntries,
-            )
-            return { partition, key, revision, document: updated }
-        } catch (e) {
-            if (isNotFound(e)) {
-                const document = await initial()
-                assert.ok(target(document), 'Initial document does not meet target.')
-                const revision = await addWithIndexes(c, table, partition, key, document)
-                return { partition, key, revision, document }
-            }
-            throw e
+        const c = await session.connection
+        const now = session.nowSeconds()
+        const { live, expired } = await getRow(c, table, partition, key, now)
+        if (!live) {
+            const document = await initial()
+            assert.ok(target(document), 'Initial document does not meet target.')
+            const leftover = leftoverEntriesOf(table, partition, key, expired)
+            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
+            return { partition, key, revision, document }
         }
+        if (target(live.document as T)) {
+            return live
+        }
+        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const updated = update(live.document as T) ?? (live.document as T)
+        assert.ok(target(updated), 'Updated document does not meet target.')
+        const revision = await updateWithIndexes(
+            c,
+            table,
+            partition,
+            key,
+            live.revision,
+            updated,
+            now,
+            oldEntries,
+        )
+        return { partition, key, revision, document: updated }
     }, options)
 }
 
@@ -948,10 +994,4 @@ export async function retryConflict<T>(fn: () => Promise<T>, options?: RetryOpti
     }
 }
 
-export function isConflict(e: unknown) {
-    return (e as { status?: unknown }).status === 409
-}
-
-export function isNotFound(e: unknown) {
-    return (e as { status?: unknown }).status === 404
-}
+export { isConflict, isNotFound } from './lib/errors.js'

@@ -1,4 +1,4 @@
-import { getDriver, type Connection } from './lib/driver.js'
+import { registerExpiry, unexpired } from './lib/expiry.js'
 import {
     assertClean,
     indexKeyDelimiter,
@@ -7,12 +7,9 @@ import {
     type IndexDefinition,
     type IndexSourceRow,
 } from './lib/indexes.js'
-import { tables, type Tables } from './partitioned.js'
-import type { KeyRange, Revision } from './schema.js'
-
-type Context = {
-    on?: (event: 'free', handler: () => Promise<void>) => boolean
-}
+import { openSession, type Session } from './lib/session.js'
+import { tables, type Context, type Tables } from './partitioned.js'
+import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
 type TableNamesOf<Schema> = keyof Schema & string
 type PartitionKeyOf<Schema, Table extends TableNamesOf<Schema>> = keyof Schema[Table] & string
@@ -51,6 +48,10 @@ export type SchemaHandle<Schema> = {
         partition: (row: IndexSource<Schema, Table>) => PartitionKey | undefined,
         key: (row: IndexSource<Schema, Table>) => string | undefined,
     ): IndexAccessor<DocumentOf<Schema, Table>, PartitionKey>
+    expiry<Table extends TableNamesOf<Schema>>(
+        table: Table,
+        expiresAt: (document: DocumentOf<Schema, Table>) => Date | undefined,
+    ): void
 }
 
 export type IndexAccessor<Document, PartitionKey extends string> = {
@@ -100,22 +101,24 @@ export function docs<Schema = GenericSchema>(): SchemaHandle<Schema> {
             registerIndex(definition)
             return indexAccessor(definition)
         },
+        expiry: (table: string, expiresAt: (document: StoredDocument) => Date | undefined) => {
+            registerExpiry(table, expiresAt)
+        },
     } as unknown as SchemaHandle<Schema>
 }
 
 function indexAccessor(definition: IndexDefinition) {
     return (context: Context) => {
-        const connection = getDriver().connect(context)
+        const session = openSession(context)
         const closer = async () => {
-            const c = await connection
+            const c = await session.connection
             await c.close()
         }
         const p = new Proxy(
             {
-                partition: (partition: string) =>
-                    new IndexReader(connection, definition, partition),
+                partition: (partition: string) => new IndexReader(session, definition, partition),
             },
-            indexPartitionsProxy(connection, definition),
+            indexPartitionsProxy(session, definition),
         )
         if (!context.on?.('free', closer)) {
             ;(p as typeof p & AsyncDisposable)[Symbol.asyncDispose] = closer
@@ -127,7 +130,7 @@ function indexAccessor(definition: IndexDefinition) {
 type GenericProxyTarget = { [k: string | symbol]: unknown }
 
 function indexPartitionsProxy<B extends object>(
-    connection: Promise<Connection>,
+    session: Session,
     definition: IndexDefinition,
 ): ProxyHandler<B> {
     return {
@@ -138,18 +141,18 @@ function indexPartitionsProxy<B extends object>(
             if (typeof property === 'symbol') {
                 return undefined
             }
-            return new IndexReader(connection, definition, property)
+            return new IndexReader(session, definition, property)
         },
     }
 }
 
 class IndexReader {
-    readonly #connection
+    readonly #session
     readonly #definition
     readonly #partition
 
-    constructor(connection: Promise<Connection>, definition: IndexDefinition, partition: string) {
-        this.#connection = connection
+    constructor(session: Session, definition: IndexDefinition, partition: string) {
+        this.#session = session
         this.#definition = definition
         this.#partition = partition
     }
@@ -180,12 +183,9 @@ class IndexReader {
     }
 
     async *#rows(range: KeyRange) {
-        const c = await this.#connection
-        for await (const row of c.getPartition(
-            indexTable(this.#definition),
-            this.#partition,
-            range,
-        )) {
+        const c = await this.#session.connection
+        const rows = c.getPartition(indexTable(this.#definition), this.#partition, range)
+        for await (const row of unexpired(rows, this.#session.nowSeconds())) {
             yield decode(row)
         }
     }
