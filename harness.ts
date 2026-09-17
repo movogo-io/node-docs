@@ -21,6 +21,26 @@ export function harness(
         await assert.rejects(c.docs.get(table, anId(), anId()), isNotFound)
     })
 
+    it('carries the HTTP status code on not found and conflicts', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        await assert.rejects(c.docs.get(table, partition, key), { statusCode: 404 })
+        await c.docs.add(table, partition, key, added, { now })
+        await assert.rejects(c.docs.add(table, partition, key, added, { now }), {
+            statusCode: 409,
+        })
+    })
+
+    it('leaves other connections from the same context open when one closes', async () => {
+        const { partition, key, document: added } = aRow()
+        const context = contextFactory()
+        const closed = await driver.connect(context)
+        await using c = await connectTo(driver, context)
+        await closed.close()
+        await c.docs.add(table, partition, key, added, { now })
+        assert.deepStrictEqual((await c.docs.get(table, partition, key)).document, added)
+    })
+
     it('gets added', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
@@ -112,6 +132,27 @@ export function harness(
                 r => (r.document as { key: string }).key,
             ),
             ['a1', 'a2', 'b'],
+        )
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition, { after: '' }),
+                r => (r.document as { key: string }).key,
+            ),
+            ['a1', 'a2', 'b', 'c1', 'c2', 'c3'],
+        )
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition, { before: '' }),
+                r => (r.document as { key: string }).key,
+            ),
+            [],
+        )
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition, { after: '', before: 'b' }),
+                r => (r.document as { key: string }).key,
+            ),
+            ['a1', 'a2'],
         )
         assert.deepStrictEqual(
             await Array.fromAsync(
@@ -889,7 +930,11 @@ function aRow<T extends { [key: string]: unknown }>(props?: T) {
 }
 
 async function connect(driver: Driver, contextFactory: () => object) {
-    const connection = await driver.connect(contextFactory())
+    return await connectTo(driver, contextFactory())
+}
+
+async function connectTo(driver: Driver, context: object) {
+    const connection = await driver.connect(context)
     return {
         docs: connection,
         [Symbol.asyncDispose]: () => connection.close(),

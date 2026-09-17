@@ -14,7 +14,9 @@ import { openSession, type Session } from './lib/session.js'
 import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
-export type Context = {
+// Intersected with `object` so it is not a weak type: a context with other
+// properties and neither of these, like a @riddance/service one, still fits.
+export type Context = object & {
     on?: (event: 'free', handler: () => Promise<void>) => boolean
     now?: () => Date
 }

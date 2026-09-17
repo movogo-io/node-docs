@@ -155,6 +155,10 @@ async function updateUserProfile(context: object, userId: string, newProfile, re
 }
 ```
 
+Not-found and conflict errors carry `statusCode` 404 and 409, so one that escapes a @riddance/service handler — typically a conflict once the retries of a helper or `withTransaction` are spent — is answered 404 or 409, not 500.
+
+Range bounds are inclusive for `after` and exclusive for `before`, and an empty string is a bound like any other: `{ after: '' }` matches every key and `{ before: '' }` none.
+
 `getOrAdd`, `addOrUpdate`, `converge` on `DocumentSet` are helper functions that manages concurrency issues by retrying conflict errors. Their `document` argument is added if it doesn't exist, `update` is called if it does exist, and `target` determines if the document needs updating. The `update` callback may either mutate the existing document in place, or return a replacement document; when it returns a document, that document is persisted instead of the existing one. That makes whole-document replacement (PUT semantics) a one-liner:
 
 ```ts

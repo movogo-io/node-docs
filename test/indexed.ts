@@ -71,6 +71,35 @@ describe('indexes', () => {
         assert.deepStrictEqual(keys, ['r1', 'r2', 'r3'])
     })
 
+    it('should read a whole index partition from an empty lower bound', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        await rentals.partition('s1').add('r1', aRental())
+        await rentals.partition('s2').add('r2', aRental())
+
+        const keys = await Array.fromAsync(
+            byId(context).all.getRange({ after: '' }),
+            row => row.key,
+        )
+        assert.deepStrictEqual(keys, ['r1', 'r2'])
+        assert.deepStrictEqual(
+            await Array.fromAsync(byId(context).all.getRange({ before: '' })),
+            [],
+        )
+    })
+
+    it('should accept a context with none of the properties the store reads', async () => {
+        const context: {
+            env: { [name: string]: string }
+            log: { info: (message: string) => void }
+        } = { env: {}, log: { info: () => undefined } }
+        await using tables = schema.tables(context)
+        await tables.IndexedRentals.partition('s1').add('r1', aRental())
+
+        await using index = byId(context)
+        assert.deepStrictEqual(await index.all.firstDocument('r1'), aRental())
+    })
+
     it('should move index entries when documents change', async () => {
         await using context = new TestContext()
         const rentals = schema.tables(context).IndexedRentals

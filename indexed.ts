@@ -224,13 +224,13 @@ function matchRange(range: KeyRange) {
         return (key: string) => key.startsWith(range.withPrefix)
     }
     const { after, before } = range
-    if (after) {
-        if (before) {
+    if (after !== undefined) {
+        if (before !== undefined) {
             return (key: string) => after <= key && key < before
         }
         return (key: string) => after <= key
     }
-    if (before) {
+    if (before !== undefined) {
         return (key: string) => key < before
     }
     return alwaysFalse

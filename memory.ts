@@ -9,7 +9,9 @@ const documentsEntry = Symbol()
 export class MemoryDriver {
     connect(context: object) {
         const ext = context as { [documentsEntry]?: MemoryDocuments }
-        return Promise.resolve((ext[documentsEntry] ??= new MemoryDocuments()))
+        return Promise.resolve(
+            new MemoryConnection((ext[documentsEntry] ??= new MemoryDocuments())),
+        )
     }
 }
 
@@ -17,7 +19,7 @@ export class PersistentMemoryDriver {
     readonly #documents = new MemoryDocuments()
 
     connect() {
-        return Promise.resolve(this.#documents)
+        return Promise.resolve(new MemoryConnection(this.#documents))
     }
 }
 
@@ -25,7 +27,7 @@ export class DelayedPersistentMemoryDriver {
     readonly #documents = new DelayedDocuments()
 
     connect() {
-        return Promise.resolve(this.#documents)
+        return Promise.resolve(new MemoryConnection(this.#documents))
     }
 }
 
@@ -35,11 +37,13 @@ type Row = {
     expiresAt?: number
 }
 
-class MemoryDocuments {
-    readonly #tables = new MapWithDefault(
-        () => new MapWithDefault<string, Map<string, Row>>(() => new Map<string, Row>()),
-    )
+class MemoryConnection {
+    readonly #documents: MemoryDocuments | DelayedDocuments
     #closed = false
+
+    constructor(documents: MemoryDocuments | DelayedDocuments) {
+        this.#documents = documents
+    }
 
     async add(
         table: string,
@@ -48,44 +52,23 @@ class MemoryDocuments {
         document: unknown,
         options: { now: number; expiresAt?: number },
     ) {
-        await this.#throwIfClosed()
-        const revision = randomUUID()
-        const p = this.#tables.get(table).get(partition)
-        if (isLive(p.get(key), options.now)) {
-            throw conflict()
-        }
-        p.set(key, storedRow(revision, document, options.expiresAt))
-        return revision
+        this.#throwIfClosed()
+        return await this.#documents.add(table, partition, key, document, options)
     }
 
     async get(table: string, partition: string, key: string) {
-        await this.#throwIfClosed()
-        const row = this.#tables.get(table).get(partition).get(key)
-        if (!row) {
-            throw notFound()
-        }
-        return { partition, ...readRow(key, row) }
+        this.#throwIfClosed()
+        return await this.#documents.get(table, partition, key)
     }
 
     async *getPartitions(table: string) {
-        await this.#throwIfClosed()
-        for (const [partition, rows] of this.#tables.get(table).entries()) {
-            await Promise.resolve()
-            if (rows.size !== 0) {
-                yield partition
-            }
-        }
+        this.#throwIfClosed()
+        yield* this.#documents.getPartitions(table)
     }
 
     async *getPartition(table: string, partition: string, range?: KeyRange) {
-        await this.#throwIfClosed()
-        const matches = matchRange(range)
-        for (const [key, row] of sortedByKey(this.#tables.get(table).get(partition))) {
-            await Promise.resolve()
-            if (matches(key)) {
-                yield readRow(key, row)
-            }
-        }
+        this.#throwIfClosed()
+        yield* this.#documents.getPartition(table, partition, range)
     }
 
     async update(
@@ -96,14 +79,15 @@ class MemoryDocuments {
         document: unknown,
         options: { now: number; expiresAt?: number },
     ) {
-        await this.#throwIfClosed()
-        const p = this.#tables.get(table).get(partition)
-        if (!hasRevision(p.get(key), currentRevision, options.now)) {
-            throw conflict()
-        }
-        const revision = randomUUID()
-        p.set(key, storedRow(revision, document, options.expiresAt))
-        return revision
+        this.#throwIfClosed()
+        return await this.#documents.update(
+            table,
+            partition,
+            key,
+            currentRevision,
+            document,
+            options,
+        )
     }
 
     async delete(
@@ -113,7 +97,99 @@ class MemoryDocuments {
         currentRevision: unknown,
         options: { now: number },
     ) {
-        await this.#throwIfClosed()
+        this.#throwIfClosed()
+        await this.#documents.delete(table, partition, key, currentRevision, options)
+    }
+
+    async transact(items: TransactionItem[], options: { now: number }) {
+        this.#throwIfClosed()
+        await this.#documents.transact(items, options)
+    }
+
+    close() {
+        this.#closed = true
+        return Promise.resolve()
+    }
+
+    #throwIfClosed() {
+        if (this.#closed) {
+            throw new Error('Connection has been closed.')
+        }
+    }
+}
+
+class MemoryDocuments {
+    readonly #tables = new MapWithDefault(
+        () => new MapWithDefault<string, Map<string, Row>>(() => new Map<string, Row>()),
+    )
+
+    add(
+        table: string,
+        partition: string,
+        key: string,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
+        const revision = randomUUID()
+        const p = this.#tables.get(table).get(partition)
+        if (isLive(p.get(key), options.now)) {
+            throw conflict()
+        }
+        p.set(key, storedRow(revision, document, options.expiresAt))
+        return revision
+    }
+
+    get(table: string, partition: string, key: string) {
+        const row = this.#tables.get(table).get(partition).get(key)
+        if (!row) {
+            throw notFound()
+        }
+        return { partition, ...readRow(key, row) }
+    }
+
+    async *getPartitions(table: string) {
+        for (const [partition, rows] of this.#tables.get(table).entries()) {
+            await Promise.resolve()
+            if (rows.size !== 0) {
+                yield partition
+            }
+        }
+    }
+
+    async *getPartition(table: string, partition: string, range?: KeyRange) {
+        const matches = matchRange(range)
+        for (const [key, row] of sortedByKey(this.#tables.get(table).get(partition))) {
+            await Promise.resolve()
+            if (matches(key)) {
+                yield readRow(key, row)
+            }
+        }
+    }
+
+    update(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
+        const p = this.#tables.get(table).get(partition)
+        if (!hasRevision(p.get(key), currentRevision, options.now)) {
+            throw conflict()
+        }
+        const revision = randomUUID()
+        p.set(key, storedRow(revision, document, options.expiresAt))
+        return revision
+    }
+
+    delete(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        options: { now: number },
+    ) {
         const p = this.#tables.get(table).get(partition)
         if (!hasRevision(p.get(key), currentRevision, options.now)) {
             throw conflict()
@@ -121,8 +197,7 @@ class MemoryDocuments {
         p.delete(key)
     }
 
-    async transact(items: TransactionItem[], options: { now: number }) {
-        await this.#throwIfClosed()
+    transact(items: TransactionItem[], options: { now: number }) {
         throwIfAnyDocumentRepeats(items)
         const applies = items.map(item => {
             const p = this.#tables.get(item.table).get(item.partition)
@@ -161,18 +236,6 @@ class MemoryDocuments {
             apply()
         }
     }
-
-    close() {
-        this.#closed = true
-        return Promise.resolve()
-    }
-
-    #throwIfClosed() {
-        if (this.#closed) {
-            return Promise.reject(new Error('Connection has been closed.'))
-        }
-        return Promise.resolve()
-    }
 }
 
 class DelayedDocuments {
@@ -186,12 +249,12 @@ class DelayedDocuments {
         options: { now: number; expiresAt?: number },
     ) {
         await using _ = await delayed()
-        return await this.#inner.add(table, partition, key, document, options)
+        return this.#inner.add(table, partition, key, document, options)
     }
 
     async get(table: string, partition: string, key: string) {
         await using _ = await delayed()
-        return await this.#inner.get(table, partition, key)
+        return this.#inner.get(table, partition, key)
     }
 
     async *getPartitions(table: string) {
@@ -217,7 +280,7 @@ class DelayedDocuments {
         options: { now: number; expiresAt?: number },
     ) {
         await using _ = await delayed()
-        return await this.#inner.update(table, partition, key, currentRevision, document, options)
+        return this.#inner.update(table, partition, key, currentRevision, document, options)
     }
 
     async delete(
@@ -228,17 +291,12 @@ class DelayedDocuments {
         options: { now: number },
     ) {
         await using _ = await delayed()
-        await this.#inner.delete(table, partition, key, currentRevision, options)
+        this.#inner.delete(table, partition, key, currentRevision, options)
     }
 
     async transact(items: TransactionItem[], options: { now: number }) {
         await using _ = await delayed()
-        await this.#inner.transact(items, options)
-    }
-
-    async close() {
-        await using _ = await delayed()
-        await this.#inner.close()
+        this.#inner.transact(items, options)
     }
 }
 
@@ -308,13 +366,13 @@ function matchRange(range?: KeyRange) {
     }
     if ('before' in range || 'after' in range) {
         const { after, before } = range
-        if (after) {
-            if (before) {
+        if (after !== undefined) {
+            if (before !== undefined) {
                 return (key: string) => after <= key && key < before
             }
             return (key: string) => after <= key
         }
-        if (before) {
+        if (before !== undefined) {
             return (key: string) => key < before
         }
     }

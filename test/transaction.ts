@@ -214,26 +214,53 @@ describe('transactions', () => {
     })
 
     it('should close the connection when the context cannot free it', async () => {
-        const driver = new PersistentMemoryDriver()
-        setDriver(driver)
+        const closes = countingCloses(new PersistentMemoryDriver())
 
         await withTransaction({}, () => Promise.resolve())
 
-        const c = await driver.connect()
-        await assert.rejects(c.get('T', 'p', 'k'), /closed/u)
+        assert.strictEqual(closes.count, 1)
     })
 
     it('should leave freeing the connection to the context', async () => {
-        const driver = new PersistentMemoryDriver()
-        setDriver(driver)
+        const closes = countingCloses(new PersistentMemoryDriver())
         const context = new TestContext()
 
         await withTransaction(context, () => Promise.resolve())
+        assert.strictEqual(closes.count, 0)
 
-        const c = await driver.connect()
-        await c.add('T', 'p', 'k', { data: 'x' }, { now: 0 })
         await context[Symbol.asyncDispose]()
-        await assert.rejects(c.add('T', 'p', 'k2', { data: 'y' }, { now: 0 }), /closed/u)
+        assert.strictEqual(closes.count, 1)
+    })
+
+    it('should keep the store readable after a transaction closed its connection', async () => {
+        setDriver(new PersistentMemoryDriver())
+        const context = {}
+
+        await withTransaction<Schema>(context, async tx => {
+            await tx.Rentals.partition('s1').add('r1', { name: 'a', count: 1 })
+        })
+
+        await using t = tables<Schema>(context)
+        assert.deepStrictEqual(await t.Rentals.partition('s1').getDocument('r1'), {
+            name: 'a',
+            count: 1,
+        })
+    })
+
+    it('should give an exhausted conflict the HTTP status code', async () => {
+        await using context = new TestContext()
+        await tables<Schema>(context).Rentals.partition('s1').add('r1', { name: 'a', count: 1 })
+
+        await assert.rejects(
+            withTransaction<Schema>(
+                context,
+                async tx => {
+                    await tx.Rentals.partition('s1').add('r1', { name: 'b', count: 2 })
+                },
+                { retries: 0 },
+            ),
+            { status: 409, statusCode: 409 },
+        )
     })
 })
 
@@ -256,6 +283,23 @@ class TestContext {
 
 function setMemoryDriver() {
     setDriver(new DelayedPersistentMemoryDriver())
+}
+
+function countingCloses(inner: PersistentMemoryDriver) {
+    const closes = { count: 0 }
+    setDriver({
+        connect: async () => {
+            const c = await inner.connect()
+            return {
+                ...spyConnection(c, (items, options) => c.transact(items, options)),
+                close: () => {
+                    ++closes.count
+                    return c.close()
+                },
+            }
+        },
+    })
+    return closes
 }
 
 function spyConnection(
