@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { setTimeout } from 'node:timers/promises'
 import { isConflict } from './lib/errors.js'
-import { getRow, getUnexpired, unexpired } from './lib/expiry.js'
+import { findEachUnexpired, findUnexpired, getRow, getUnexpired, unexpired } from './lib/expiry.js'
 import {
     addWithIndexes,
     deleteWithIndexes,
@@ -81,6 +81,12 @@ type FixedKey<Document> = {
         partition: string,
     ) => Promise<{ partition: string; revision: Revision; document: Document }>
     getDocument: (partition: string) => Promise<Document>
+    find: (
+        partition: string,
+    ) => Promise<{ partition: string; revision: Revision; document: Document } | undefined>
+    findEach: (
+        partitions: readonly string[],
+    ) => Promise<{ partition: string; revision: Revision; document: Document }[]>
     update: (partition: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: {
         partition: string
@@ -147,6 +153,12 @@ type NamedPartition<Document> = {
     add: (key: string, document: Document) => Promise<Revision>
     get: (key: string) => Promise<{ key: string; revision: Revision; document: Document }>
     getDocument: (key: string) => Promise<Document>
+    find: (
+        key: string,
+    ) => Promise<{ key: string; revision: Revision; document: Document } | undefined>
+    findEach: (
+        keys: readonly string[],
+    ) => Promise<{ key: string; revision: Revision; document: Document }[]>
     getAll: () => AsyncIterable<{ key: string; revision: Revision; document: Document }>
     getRange: (
         range: KeyRange,
@@ -298,6 +310,19 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 const r = await getUnexpired(c, table, partition, key, session.nowSeconds())
                 return r.document
             },
+            async find(partition: string) {
+                const c = await session.connection
+                return await findUnexpired(c, table, partition, key, session.nowSeconds())
+            },
+            async findEach(partitions: readonly string[]) {
+                const c = await session.connection
+                return await findEachUnexpired(
+                    c,
+                    table,
+                    partitions.map(partition => ({ partition, key })),
+                    session.nowSeconds(),
+                )
+            },
             async update(partition: string, revision: Revision, document: StoredDocument) {
                 const c = await session.connection
                 return await updateWithIndexes(
@@ -426,6 +451,19 @@ class Partition {
     async getDocument(key: string) {
         const r = await this.get(key)
         return r.document
+    }
+    async find(key: string) {
+        const c = await this.#session.connection
+        return await findUnexpired(c, this.#table, this.#partition, key, this.#session.nowSeconds())
+    }
+    async findEach(keys: readonly string[]) {
+        const c = await this.#session.connection
+        return await findEachUnexpired(
+            c,
+            this.#table,
+            keys.map(key => ({ partition: this.#partition, key })),
+            this.#session.nowSeconds(),
+        )
     }
     async *getAll() {
         const c = await this.#session.connection
@@ -593,6 +631,12 @@ type TransactionFixedKey<Document> = {
         partition: string,
     ) => Promise<{ partition: string; revision: Revision; document: Document }>
     getDocument: (partition: string) => Promise<Document>
+    find: (
+        partition: string,
+    ) => Promise<{ partition: string; revision: Revision; document: Document } | undefined>
+    findEach: (
+        partitions: readonly string[],
+    ) => Promise<{ partition: string; revision: Revision; document: Document }[]>
     update: (partition: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: {
         partition: string
@@ -607,6 +651,12 @@ type TransactionNamedPartition<Document> = {
     add: (key: string, document: Document) => Promise<Revision>
     get: (key: string) => Promise<{ key: string; revision: Revision; document: Document }>
     getDocument: (key: string) => Promise<Document>
+    find: (
+        key: string,
+    ) => Promise<{ key: string; revision: Revision; document: Document } | undefined>
+    findEach: (
+        keys: readonly string[],
+    ) => Promise<{ key: string; revision: Revision; document: Document }[]>
     getAll: () => AsyncIterable<{ key: string; revision: Revision; document: Document }>
     getRange: (
         range: KeyRange,
@@ -708,6 +758,12 @@ class TransactionPartition {
     getDocument(key: string) {
         return this.#reads.getDocument(key)
     }
+    find(key: string) {
+        return this.#reads.find(key)
+    }
+    findEach(keys: readonly string[]) {
+        return this.#reads.findEach(keys)
+    }
     getAll() {
         return this.#reads.getAll()
     }
@@ -757,6 +813,19 @@ class TransactionFixedKeySet {
     async getDocument(partition: string) {
         const r = await this.get(partition)
         return r.document
+    }
+    async find(partition: string) {
+        const c = await this.#session.connection
+        return await findUnexpired(c, this.#table, partition, this.#key, this.#session.nowSeconds())
+    }
+    async findEach(partitions: readonly string[]) {
+        const c = await this.#session.connection
+        return await findEachUnexpired(
+            c,
+            this.#table,
+            partitions.map(partition => ({ partition, key: this.#key })),
+            this.#session.nowSeconds(),
+        )
     }
     add(partition: string, document: StoredDocument) {
         return this.#buffer.add(this.#table, partition, this.#key, document)

@@ -79,6 +79,8 @@ type DocumentSet<Document> = {
     add: (key: string, document: Document) => Promise<Revision>;
     get: (key: string) => Promise<Row<Document>>;
     getDocument: (key: string) => Promise<Document>;
+    find: (key: string) => Promise<Row<Document> | undefined>;
+    findEach: (keys: readonly string[]) => Promise<Row<Document>[]>;
     getAll: () => AsyncIterable<Row<Document>>;
     getRange: (
         range:
@@ -105,6 +107,10 @@ type DocumentSet<Document> = {
 type Row<Document> = { key: string; revision: Revision; document: Document };
 ```
 
+`get` throws not found; `find` answers `undefined` instead, for the callers to whom absence is a normal case — an existence probe, an optional relation, an event handler for which a document that is gone is a state to skip. `get` stays the default: a `find` whose caller forgets the `undefined` branch becomes a 500, or an accidental default, far from the read.
+
+`findEach` resolves a list of keys. The result follows the order of `keys`, holds each distinct key at most once, and leaves out a key whose document is missing or expired — an index row can outlive the document it points at, and a list read from a lagging replica can still name one a delete has removed. A driver without a batch read pays one round trip per key and, on a cold connection, one TLS connection per read in flight — an unbounded `Promise.all` over a tenant-sized list has failed a production request outright with `getaddrinfo EBUSY` — so the store then reads at most 16 at a time. So a service neither writes the chunked loop itself nor the `for … await get` ladder it replaces; it calls `findEach`, and a driver with a batch read serves the whole list in as few calls as its batch limit allows. On `withKey` sets, `find` and `findEach` take partitions, like `get` does.
+
 Each table also exposes `getPartitions()`, an async iterable of the partition keys currently holding documents (expired ones included until the driver removes them). In DynamoDB that is a full-table scan whose cost grows with everything ever stored, so reserve it for sweeps and migrations and never call it from a request handler.
 
 Consider adding helper functions to `./lib/schema.ts` like this
@@ -127,20 +133,12 @@ export function invitations(context: object) {
 }
 ```
 
-You may then not need to export the `Schema` type. To help deal with errors there are two utility types `isNotFound` and `isConflict`:
+You may then not need to export the `Schema` type. Where absence has a default, `find` says so in one line; `isNotFound` and `isConflict` identify the store's errors where a `try` is still needed, such as an `add` that may lose a race:
 
 ```ts
 async function getUserProfile(context: object, userId: string) {
-    try {
-        return await userProfiles(context).getDocument(userId);
-    } catch (e) {
-        if (isNotFound(e)) {
-            return {
-                ...defaultProfiles,
-            };
-        }
-        throw e;
-    }
+    const row = await userProfiles(context).find(userId);
+    return row?.document ?? { ...defaultProfiles };
 }
 
 async function updateUserProfile(context: object, userId: string, newProfile, revision) {
@@ -201,7 +199,7 @@ await withTransaction<Schema>(context, async (tx) => {
 The `tx` argument mirrors the `tables` surface with these rules:
 
 - **Writes are buffered.** `add`, `update`, `updateRow`, `check`, and `delete` do not touch storage when called; they are queued and applied atomically when the callback resolves. Returned revisions are final and usable after the commit.
-- **Reads return committed state.** `get`, `getDocument`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction.
+- **Reads return committed state.** `get`, `getDocument`, `find`, `findEach`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction.
 - **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
 - **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried.
 - **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
@@ -295,7 +293,7 @@ Rules and properties:
 
 - **At most one expiry per table, declared before the first write.** A second declaration for the same table throws. Writes consult the declaration, so `schema.expiry` must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
 - **Expiry is second-granular.** A document is expired from the start of the second containing its expiry instant.
-- **An expired document is invisible to every operation, under every driver.** `get` and `getDocument` throw not found; `getAll`, `getRange`, and index lookups skip it; reads inside `withTransaction` behave the same; `add` replaces it as if it were absent, so `getOrAdd`, `addOrUpdate`, and `converge` add a fresh document over an expired one; `update`, `delete`, and `check` conflict, like on a deleted document: re-read, find nothing, add fresh.
+- **An expired document is invisible to every operation, under every driver.** `get` and `getDocument` throw not found; `find` answers `undefined`; `findEach`, `getAll`, `getRange`, and index lookups skip it; reads inside `withTransaction` behave the same; `add` replaces it as if it were absent, so `getOrAdd`, `addOrUpdate`, and `converge` add a fresh document over an expired one; `update`, `delete`, and `check` conflict, like on a deleted document: re-read, find nothing, add fresh.
 - **Drivers remove expired rows lazily.** The store hands every driver the expiry explicitly; the DynamoDB driver stores it in the table's time-to-live attribute and leaves the deletion to DynamoDB. Nothing may rely on an expired row still existing, and nothing needs to remove it — though `getPartitions()` may list partitions whose only documents are expired but not yet removed.
 - **The clock comes from the context.** When the context has a `now()` function — every @riddance/service context does — the store reads the time from it, so tests can move the clock instead of sleeping. Without one the wall clock is used. A `now()` returning an invalid `Date` fails the operation.
 - **The stored expiry is what counts.** Reads never run the extractor: a document written before the declaration, or under a previous extractor, keeps its stored expiry (or none) until it is rewritten, so it stays visible and never expires until an update stores a new expiry. Changing an extractor therefore needs a backfill that rewrites each row, exactly like changing an index.
@@ -311,4 +309,4 @@ import { decorateDriver, type Driver } from '@movogo-io/docs/driver';
 decorateDriver((driver: Driver) => wrapped(driver));
 ```
 
-Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget.
+Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget. `getMany` is optional on a connection: a decorator that lists the methods it forwards and leaves it out turns every `findEach` beneath it into single reads, 16 at a time, which is correct but forfeits the driver's batch read — forward it when the wrapped connection has one.

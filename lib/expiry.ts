@@ -52,6 +52,81 @@ export async function getUnexpired(
     return live
 }
 
+export async function findUnexpired(
+    c: Connection,
+    table: string,
+    partition: string,
+    key: string,
+    nowSeconds: number,
+) {
+    const { live } = await getRow(c, table, partition, key, nowSeconds)
+    return live
+}
+
+// Each distinct ref at most once, in the order of `refs`; a ref whose row is
+// missing or expired is left out.
+export async function findEachUnexpired(
+    c: Connection,
+    table: string,
+    refs: readonly { partition: string; key: string }[],
+    nowSeconds: number,
+) {
+    const distinct = new Map(refs.map(ref => [refKey(ref), ref])).values().toArray()
+    if (distinct.length === 0) {
+        return []
+    }
+    const live = new Map<string, LiveRow>()
+    for (const { expiresAt, ...row } of await getManyRaw(c, table, distinct)) {
+        if (!isExpired(expiresAt, nowSeconds)) {
+            live.set(refKey(row), row)
+        }
+    }
+    return distinct.flatMap(ref => live.get(refKey(ref)) ?? [])
+}
+
+type LiveRow = Omit<Awaited<ReturnType<Connection['get']>>, 'expiresAt'>
+
+// Partitions and keys are arbitrary strings, so no delimiter is safe to join
+// them with; a JSON pair is.
+function refKey(ref: { partition: string; key: string }) {
+    return JSON.stringify([ref.partition, ref.key])
+}
+
+// Without a batch read, a driver pays one round trip per ref and, on a cold
+// connection, one TLS connection per read in flight — an unbounded burst over
+// a tenant-sized list has failed a production request outright with
+// `getaddrinfo EBUSY`. 16 in flight keeps the burst harmless.
+const readsInFlightMax = 16
+
+async function getManyRaw(
+    c: Connection,
+    table: string,
+    refs: readonly { partition: string; key: string }[],
+) {
+    if (c.getMany) {
+        return await c.getMany(table, refs)
+    }
+    const rows: Awaited<ReturnType<Connection['get']>>[] = []
+    for (let start = 0; start < refs.length; start += readsInFlightMax) {
+        const chunk = await Promise.all(
+            refs.slice(start, start + readsInFlightMax).map(ref => getRaw(c, table, ref)),
+        )
+        rows.push(...chunk.filter(row => row !== undefined))
+    }
+    return rows
+}
+
+async function getRaw(c: Connection, table: string, ref: { partition: string; key: string }) {
+    try {
+        return await c.get(table, ref.partition, ref.key)
+    } catch (e) {
+        if (isNotFound(e)) {
+            return undefined
+        }
+        throw e
+    }
+}
+
 export async function getRow(
     c: Connection,
     table: string,

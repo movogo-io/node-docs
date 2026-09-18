@@ -601,6 +601,88 @@ export function harness(
         )
     })
 
+    // A batch read is optional in the contract; a driver without one is served
+    // by the store reading through `get`, so the cases below pass it by.
+    it('gets many rows raw across partitions, leaving missing ones out', async () => {
+        const first = aRow()
+        const second = aRow()
+        await using c = await connect(driver, contextFactory)
+        if (!c.docs.getMany) {
+            return
+        }
+        const firstRevision = await c.docs.add(table, first.partition, first.key, first.document, {
+            now,
+            expiresAt: now + 60,
+        })
+        const secondRevision = await c.docs.add(
+            table,
+            second.partition,
+            second.key,
+            second.document,
+            { now },
+        )
+        const found = await c.docs.getMany(table, [
+            { partition: first.partition, key: first.key },
+            { partition: second.partition, key: anId() },
+            { partition: second.partition, key: second.key },
+        ])
+        assert.deepStrictEqual(
+            found.toSorted((a, b) => a.partition.localeCompare(b.partition)),
+            [
+                {
+                    partition: first.partition,
+                    key: first.key,
+                    revision: firstRevision,
+                    document: first.document,
+                    expiresAt: now + 60,
+                },
+                {
+                    partition: second.partition,
+                    key: second.key,
+                    revision: secondRevision,
+                    document: second.document,
+                },
+            ].toSorted((a, b) => a.partition.localeCompare(b.partition)),
+        )
+    })
+
+    it('gets many rows beyond any batch limit, from partitions with and without rows', async () => {
+        await using c = await connect(driver, contextFactory)
+        if (!c.docs.getMany) {
+            return
+        }
+        const empty = anId()
+        const rows = Array.from({ length: 101 }, () => aRow())
+        const revisions = await Promise.all(
+            rows.map(r => c.docs.add(table, r.partition, r.key, r.document, { now })),
+        )
+        const found = await c.docs.getMany(table, [
+            { partition: empty, key: anId() },
+            ...rows.map(r => ({ partition: r.partition, key: r.key })),
+        ])
+        assert.deepStrictEqual(
+            found.toSorted((a, b) => a.partition.localeCompare(b.partition)),
+            rows
+                .map((r, i) => ({
+                    partition: r.partition,
+                    key: r.key,
+                    revision: revisions[i],
+                    document: r.document,
+                }))
+                .toSorted((a, b) => a.partition.localeCompare(b.partition)),
+        )
+    })
+
+    it('gets no rows for refs in other tables', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        if (!c.docs.getMany) {
+            return
+        }
+        await c.docs.add(table, partition, key, added, { now })
+        assert.deepStrictEqual(await c.docs.getMany(otherTable, [{ partition, key }]), [])
+    })
+
     it('rejects adding over an unexpired row', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)

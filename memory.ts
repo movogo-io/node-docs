@@ -61,6 +61,11 @@ class MemoryConnection {
         return await this.#documents.get(table, partition, key)
     }
 
+    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+        this.#throwIfClosed()
+        return await this.#documents.getMany(table, refs)
+    }
+
     async *getPartitions(table: string) {
         this.#throwIfClosed()
         yield* this.#documents.getPartitions(table)
@@ -145,6 +150,20 @@ class MemoryDocuments {
             throw notFound()
         }
         return { partition, ...readRow(key, row) }
+    }
+
+    // Reversed, so that a store relying on the order a batch read happens to
+    // return rows in fails here rather than against a driver whose order
+    // varies from call to call.
+    getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+        const found = []
+        for (const { partition, key } of refs.toReversed()) {
+            const row = this.#tables.get(table).get(partition).get(key)
+            if (row) {
+                found.push({ partition, ...readRow(key, row) })
+            }
+        }
+        return found
     }
 
     async *getPartitions(table: string) {
@@ -255,6 +274,11 @@ class DelayedDocuments {
     async get(table: string, partition: string, key: string) {
         await using _ = await delayed()
         return this.#inner.get(table, partition, key)
+    }
+
+    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+        await using _ = await delayed()
+        return this.#inner.getMany(table, refs)
     }
 
     async *getPartitions(table: string) {

@@ -84,6 +84,18 @@ export type Connection = {
         partition: string,
         key: string,
     ) => Promise<Row<StoredDocument> & { partition: string; key: string; expiresAt?: number }>
+    // The rows among `refs` that exist, in any order, raw like `get`; a
+    // missing one is simply absent. `refs` is non-empty, distinct, and may
+    // span partitions. A driver with a batch read serves the whole list here
+    // in as many calls as its batch limit needs, and answers with every row
+    // that exists or throws: a partial list (a batch left with unprocessed
+    // keys, say) is indistinguishable from deleted documents to the store.
+    // Without one the store reads each ref through `get`, a bounded number at
+    // a time.
+    getMany?: (
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+    ) => Promise<(Row<StoredDocument> & { partition: string; key: string; expiresAt?: number })[]>
     getPartitions: (table: string) => AsyncIterable<string>
     getPartition: (
         table: string,
