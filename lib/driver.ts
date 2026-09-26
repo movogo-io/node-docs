@@ -149,18 +149,23 @@ export type Connection = {
     transact: (items: TransactionItem[], options: { now: number }) => Promise<void>
 }
 
-// The driver, its decorators and the index and expiry registries live in this
-// module's scope, so a second copy of the package in one process would split
-// them: writes through one copy bypass the other's decorators and indexes. The
-// first copy loaded claims the process; a later one refuses to load.
+// The driver, its decorators and the index and expiry registries live in this module's scope, so a second copy of the package in one process would split them: writes through one copy bypass the other's decorators and indexes. The first copy loaded claims the process; a later one refuses to load.
+// The version names the copy in the error above. A deployed service is bundled
+// into one file with no package.json beside it, so the read may fail there; the
+// claim itself needs only the symbol, and the URL still tells the copies apart.
+function packageVersion() {
+    try {
+        return String(
+            (createRequire(import.meta.url)('../package.json') as { version: unknown }).version,
+        )
+    } catch {
+        return 'bundled'
+    }
+}
+
 function claimProcess() {
     const claim = Symbol.for('@movogo-io/docs')
-    const copy = {
-        version: String(
-            (createRequire(import.meta.url)('../package.json') as { version: unknown }).version,
-        ),
-        url: import.meta.url,
-    }
+    const copy = { version: packageVersion(), url: import.meta.url }
     const claimed = (globalThis as { [claim]?: { version: string; url: string } })[claim]
     if (claimed !== undefined) {
         throw new Error(
