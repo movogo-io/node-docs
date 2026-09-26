@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
-import type { TransactionItem } from './lib/driver.js'
+import type { ReadOptions, TransactionItem } from './lib/driver.js'
 import { conflict, notFound } from './lib/errors.js'
+import { isoOf } from './lib/expiry.js'
 import type { KeyRange } from './schema.js'
 
 const documentsEntry = Symbol()
@@ -31,17 +32,33 @@ export class DelayedPersistentMemoryDriver {
     }
 }
 
+// Eventually consistent reads, deterministically: the first read of a row
+// without `consistent: true` after a write to it sees the row as it was before
+// that write (present, absent or expired), the way a DynamoDB replica can for
+// about a second; every later read, and every consistent read, sees the write.
+// A store that reads back what it just wrote and decides on what it sees fails
+// here instead of in production.
+export class LaggingPersistentMemoryDriver {
+    readonly #documents = new LaggingDocuments()
+
+    connect() {
+        return Promise.resolve(new MemoryConnection(this.#documents))
+    }
+}
+
 type Row = {
     json: string
     revision: string
+    seq: number
+    updatedAt: string
     expiresAt?: number
 }
 
 class MemoryConnection {
-    readonly #documents: MemoryDocuments | DelayedDocuments
+    readonly #documents: MemoryDocuments | DelayedDocuments | LaggingDocuments
     #closed = false
 
-    constructor(documents: MemoryDocuments | DelayedDocuments) {
+    constructor(documents: MemoryDocuments | DelayedDocuments | LaggingDocuments) {
         this.#documents = documents
     }
 
@@ -56,14 +73,20 @@ class MemoryConnection {
         return await this.#documents.add(table, partition, key, document, options)
     }
 
-    async get(table: string, partition: string, key: string) {
+    // Memory is consistent by construction, so the read options are accepted
+    // and ignored.
+    async get(table: string, partition: string, key: string, options?: ReadOptions) {
         this.#throwIfClosed()
-        return await this.#documents.get(table, partition, key)
+        return await this.#documents.get(table, partition, key, options)
     }
 
-    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+    async getMany(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
+    ) {
         this.#throwIfClosed()
-        return await this.#documents.getMany(table, refs)
+        return await this.#documents.getMany(table, refs, options)
     }
 
     async *getPartitions(table: string) {
@@ -71,9 +94,9 @@ class MemoryConnection {
         yield* this.#documents.getPartitions(table)
     }
 
-    async *getPartition(table: string, partition: string, range?: KeyRange) {
+    async *getPartition(table: string, partition: string, range?: KeyRange, options?: ReadOptions) {
         this.#throwIfClosed()
-        yield* this.#documents.getPartition(table, partition, range)
+        yield* this.#documents.getPartition(table, partition, range, options)
     }
 
     async update(
@@ -135,16 +158,23 @@ class MemoryDocuments {
         document: unknown,
         options: { now: number; expiresAt?: number },
     ) {
-        const revision = randomUUID()
         const p = this.#tables.get(table).get(partition)
-        if (isLive(p.get(key), options.now)) {
+        const existing = p.get(key)
+        if (isLive(existing, options.now)) {
             throw conflict()
         }
-        p.set(key, storedRow(revision, document, options.expiresAt))
-        return revision
+        const row = storedRow(
+            randomUUID(),
+            document,
+            options.expiresAt,
+            nextSeq(existing),
+            isoOf(options.now),
+        )
+        p.set(key, row)
+        return written(row)
     }
 
-    get(table: string, partition: string, key: string) {
+    get(table: string, partition: string, key: string, _options?: ReadOptions) {
         const row = this.#tables.get(table).get(partition).get(key)
         if (!row) {
             throw notFound()
@@ -155,7 +185,11 @@ class MemoryDocuments {
     // Reversed, so that a store relying on the order a batch read happens to
     // return rows in fails here rather than against a driver whose order
     // varies from call to call.
-    getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+    getMany(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        _options?: ReadOptions,
+    ) {
         const found = []
         for (const { partition, key } of refs.toReversed()) {
             const row = this.#tables.get(table).get(partition).get(key)
@@ -164,6 +198,11 @@ class MemoryDocuments {
             }
         }
         return found
+    }
+
+    // The stored row as it is, expired or not, for a driver layered on top.
+    peek(table: string, partition: string, key: string) {
+        return this.#tables.get(table).get(partition).get(key)
     }
 
     async *getPartitions(table: string) {
@@ -175,7 +214,12 @@ class MemoryDocuments {
         }
     }
 
-    async *getPartition(table: string, partition: string, range?: KeyRange) {
+    async *getPartition(
+        table: string,
+        partition: string,
+        range?: KeyRange,
+        _options?: ReadOptions,
+    ) {
         const matches = matchRange(range)
         for (const [key, row] of sortedByKey(this.#tables.get(table).get(partition))) {
             await Promise.resolve()
@@ -194,12 +238,19 @@ class MemoryDocuments {
         options: { now: number; expiresAt?: number },
     ) {
         const p = this.#tables.get(table).get(partition)
-        if (!hasRevision(p.get(key), currentRevision, options.now)) {
+        const existing = p.get(key)
+        if (!hasRevision(existing, currentRevision, options.now)) {
             throw conflict()
         }
-        const revision = randomUUID()
-        p.set(key, storedRow(revision, document, options.expiresAt))
-        return revision
+        const row = storedRow(
+            randomUUID(),
+            document,
+            options.expiresAt,
+            existing.seq + 1,
+            isoOf(options.now),
+        )
+        p.set(key, row)
+        return written(row)
     }
 
     delete(
@@ -218,6 +269,7 @@ class MemoryDocuments {
 
     transact(items: TransactionItem[], options: { now: number }) {
         throwIfAnyDocumentRepeats(items)
+        const updatedAt = isoOf(options.now)
         const applies = items.map(item => {
             const p = this.#tables.get(item.table).get(item.partition)
             const existing = p.get(item.key)
@@ -226,29 +278,63 @@ class MemoryDocuments {
                     if (isLive(existing, options.now)) {
                         throw conflict()
                     }
-                    return () =>
-                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
+                    return () => {
+                        p.set(
+                            item.key,
+                            storedRow(
+                                item.newRevision,
+                                item.document,
+                                item.expiresAt,
+                                nextSeq(existing),
+                                updatedAt,
+                            ),
+                        )
+                    }
                 case 'update':
                     if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
-                    return () =>
-                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
+                    return () => {
+                        p.set(
+                            item.key,
+                            storedRow(
+                                item.newRevision,
+                                item.document,
+                                item.expiresAt,
+                                existing.seq + 1,
+                                updatedAt,
+                            ),
+                        )
+                    }
                 case 'delete':
                     if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
-                    return () => p.delete(item.key)
+                    return () => {
+                        p.delete(item.key)
+                    }
                 case 'check':
                     if (!hasRevision(existing, item.revision, options.now)) {
                         throw conflict()
                     }
                     return () => undefined
                 case 'put':
-                    return () =>
-                        p.set(item.key, storedRow(item.newRevision, item.document, item.expiresAt))
+                    return () => {
+                        p.set(
+                            item.key,
+                            storedRow(
+                                item.newRevision,
+                                item.document,
+                                item.expiresAt,
+                                nextSeq(existing),
+                                updatedAt,
+                            ),
+                        )
+                    }
                 case 'clear':
-                    return () => p.delete(item.key)
+                    return () => {
+                        p.delete(item.key)
+                    }
             }
         })
         for (const apply of applies) {
@@ -271,14 +357,18 @@ class DelayedDocuments {
         return this.#inner.add(table, partition, key, document, options)
     }
 
-    async get(table: string, partition: string, key: string) {
+    async get(table: string, partition: string, key: string, options?: ReadOptions) {
         await using _ = await delayed()
-        return this.#inner.get(table, partition, key)
+        return this.#inner.get(table, partition, key, options)
     }
 
-    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+    async getMany(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
+    ) {
         await using _ = await delayed()
-        return this.#inner.getMany(table, refs)
+        return this.#inner.getMany(table, refs, options)
     }
 
     async *getPartitions(table: string) {
@@ -288,9 +378,9 @@ class DelayedDocuments {
         }
     }
 
-    async *getPartition(table: string, partition: string, range?: KeyRange) {
+    async *getPartition(table: string, partition: string, range?: KeyRange, options?: ReadOptions) {
         await using _ = await delayed()
-        for await (const row of this.#inner.getPartition(table, partition, range)) {
+        for await (const row of this.#inner.getPartition(table, partition, range, options)) {
             yield row
         }
     }
@@ -324,12 +414,168 @@ class DelayedDocuments {
     }
 }
 
-function storedRow(revision: unknown, document: unknown, expiresAt: number | undefined): Row {
+// A stale row is the version before the first write since the replica last
+// caught up, `absent` when the row did not exist. One eventual read of the
+// row catches the replica up; a consistent read never touches it.
+const absent = Symbol('absent')
+type Stale = Row | typeof absent
+
+class LaggingDocuments {
+    readonly #inner = new MemoryDocuments()
+    readonly #stale = new MapWithDefault(
+        () => new MapWithDefault<string, Map<string, Stale>>(() => new Map<string, Stale>()),
+    )
+
+    add(
+        table: string,
+        partition: string,
+        key: string,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
+        this.#remember(table, partition, key)
+        return this.#inner.add(table, partition, key, document, options)
+    }
+
+    get(table: string, partition: string, key: string, options?: ReadOptions) {
+        if (options?.consistent) {
+            return this.#inner.get(table, partition, key)
+        }
+        const stale = this.#catchUp(table, partition, key)
+        if (stale === undefined) {
+            return this.#inner.get(table, partition, key)
+        }
+        if (stale === absent) {
+            throw notFound()
+        }
+        return { partition, ...readRow(key, stale) }
+    }
+
+    getMany(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
+    ) {
+        if (options?.consistent) {
+            return this.#inner.getMany(table, refs)
+        }
+        const found = []
+        for (const { partition, key } of refs.toReversed()) {
+            const row =
+                this.#catchUp(table, partition, key) ?? this.#inner.peek(table, partition, key)
+            if (row !== undefined && row !== absent) {
+                found.push({ partition, ...readRow(key, row) })
+            }
+        }
+        return found
+    }
+
+    getPartitions(table: string) {
+        return this.#inner.getPartitions(table)
+    }
+
+    async *getPartition(table: string, partition: string, range?: KeyRange, options?: ReadOptions) {
+        if (options?.consistent) {
+            yield* this.#inner.getPartition(table, partition, range)
+            return
+        }
+        const matches = matchRange(range)
+        const view = new Map<string, Row>()
+        for await (const row of this.#inner.getPartition(table, partition, range)) {
+            const { key, ...rest } = row
+            view.set(
+                key,
+                storedRow(rest.revision, rest.document, rest.expiresAt, rest.seq, rest.updatedAt),
+            )
+        }
+        for (const [key, stale] of this.#stale.get(table).get(partition)) {
+            if (!matches(key)) {
+                continue
+            }
+            this.#catchUp(table, partition, key)
+            if (stale === absent) {
+                view.delete(key)
+            } else {
+                view.set(key, stale)
+            }
+        }
+        for (const [key, row] of sortedByKey(view)) {
+            await Promise.resolve()
+            yield readRow(key, row)
+        }
+    }
+
+    update(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        document: unknown,
+        options: { now: number; expiresAt?: number },
+    ) {
+        this.#remember(table, partition, key)
+        return this.#inner.update(table, partition, key, currentRevision, document, options)
+    }
+
+    delete(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        options: { now: number },
+    ) {
+        this.#remember(table, partition, key)
+        this.#inner.delete(table, partition, key, currentRevision, options)
+    }
+
+    transact(items: TransactionItem[], options: { now: number }) {
+        for (const item of items) {
+            this.#remember(item.table, item.partition, item.key)
+        }
+        this.#inner.transact(items, options)
+    }
+
+    // A write that fails leaves the row as it was, and the remembered version
+    // is what it was, so remembering before the write is right either way.
+    #remember(table: string, partition: string, key: string) {
+        const stale = this.#stale.get(table).get(partition)
+        if (!stale.has(key)) {
+            stale.set(key, this.#inner.peek(table, partition, key) ?? absent)
+        }
+    }
+
+    #catchUp(table: string, partition: string, key: string) {
+        const stale = this.#stale.get(table).get(partition)
+        const version = stale.get(key)
+        stale.delete(key)
+        return version
+    }
+}
+
+function storedRow(
+    revision: unknown,
+    document: unknown,
+    expiresAt: number | undefined,
+    seq: number,
+    updatedAt: string,
+): Row {
     return {
         revision: revision as string,
         json: JSON.stringify(document),
+        seq,
+        updatedAt,
         ...(expiresAt !== undefined && { expiresAt }),
     }
+}
+
+// The next write's `seq`: one past the row under the key, live or expired; 0
+// when there is none, a deleted row included.
+function nextSeq(existing: Row | undefined) {
+    return existing === undefined ? 0 : existing.seq + 1
+}
+
+function written(row: Row) {
+    return { revision: row.revision, seq: row.seq, updatedAt: row.updatedAt }
 }
 
 function readRow(key: string, row: Row) {
@@ -337,6 +583,8 @@ function readRow(key: string, row: Row) {
         key,
         revision: row.revision,
         document: JSON.parse(row.json) as unknown,
+        seq: row.seq,
+        updatedAt: row.updatedAt,
         ...(row.expiresAt !== undefined && { expiresAt: row.expiresAt }),
     }
 }
@@ -345,7 +593,7 @@ function isLive(row: Row | undefined, now: number): row is Row {
     return row !== undefined && (row.expiresAt === undefined || now < row.expiresAt)
 }
 
-function hasRevision(row: Row | undefined, revision: unknown, now: number) {
+function hasRevision(row: Row | undefined, revision: unknown, now: number): row is Row {
     return isLive(row, now) && row.revision === revision
 }
 

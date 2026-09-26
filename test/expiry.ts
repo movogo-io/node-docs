@@ -153,6 +153,8 @@ describe('expiry', () => {
             key: 'h1',
             revision,
             document: { unitId: 'u2' },
+            seq: 1,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
     })
 
@@ -189,15 +191,19 @@ describe('expiry', () => {
             key: 'h1',
             revision,
             document,
+            seq: 0,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
         assert.deepStrictEqual(await Array.fromAsync(holds.getAll()), [
-            { key: 'h1', revision, document },
+            { key: 'h1', revision, document, seq: 0, updatedAt: '2026-09-17T12:00:00.000Z' },
         ])
         assert.deepStrictEqual(await holds.getOrAdd('h1', { unitId: 'u2' }), {
             partition: 's1',
             key: 'h1',
             revision,
             document,
+            seq: 0,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
         assert.deepStrictEqual(await byUnit(context).partition('u1').first('h1'), {
             key: 'h1',
@@ -211,6 +217,8 @@ describe('expiry', () => {
                 key: 'h1',
                 revision,
                 document,
+                seq: 0,
+                updatedAt: '2026-09-17T12:00:00.000Z',
             })
         })
     })
@@ -384,6 +392,8 @@ describe('expiry', () => {
             key: 'h1',
             revision,
             document: { unitId: 'u2' },
+            seq: 1,
+            updatedAt: '2026-09-17T12:30:00.000Z',
         })
         assert.deepStrictEqual((await byUnit(context).partition('u2').first('h1'))?.document, {
             unitId: 'u2',
@@ -483,7 +493,15 @@ describe('expiry', () => {
 
         context.clock = new Date('2026-09-17T12:30Z')
         const got = await holds.getOrAdd('h1', { unitId: 'u2' })
-        assert.deepStrictEqual(got.document, { unitId: 'u2' })
+        assert.deepStrictEqual(await holds.get('h1'), {
+            partition: 's1',
+            key: 'h1',
+            revision: got.revision,
+            document: { unitId: 'u2' },
+            seq: 1,
+            updatedAt: '2026-09-17T12:30:00.000Z',
+        })
+        assert.deepStrictEqual(got, await holds.get('h1'))
         const added = await holds.addOrUpdate('h2', { unitId: 'u2' }, existing => {
             existing.unitId = 'updated'
         })
@@ -523,6 +541,56 @@ describe('expiry', () => {
         )
     })
 
+    it('should count the writes of the retry helpers like plain updates', async () => {
+        await using context = new TestContext()
+        const holds = schema.tables(context).ExpiringHolds.partition('s1')
+        await holds.add('h1', { unitId: 'u1' })
+
+        context.clock = new Date('2026-09-17T12:30Z')
+        const updated = await holds.addOrUpdate('h1', { unitId: 'u9' }, existing => {
+            existing.unitId = 'u2'
+        })
+        assert.deepStrictEqual(await holds.get('h1'), {
+            partition: 's1',
+            key: 'h1',
+            revision: updated.revision,
+            document: { unitId: 'u2' },
+            seq: 1,
+            updatedAt: '2026-09-17T12:30:00.000Z',
+        })
+        assert.deepStrictEqual(updated, { action: 'update', ...(await holds.get('h1')) })
+
+        context.clock = new Date('2026-09-17T13:00Z')
+        const converged = await holds.converge(
+            'h1',
+            hold => hold.unitId === 'u3',
+            { unitId: 'u3' },
+            existing => {
+                existing.unitId = 'u3'
+            },
+        )
+        assert.deepStrictEqual(await holds.get('h1'), {
+            partition: 's1',
+            key: 'h1',
+            revision: converged.revision,
+            document: { unitId: 'u3' },
+            seq: 2,
+            updatedAt: '2026-09-17T13:00:00.000Z',
+        })
+        assert.deepStrictEqual(converged, await holds.get('h1'))
+
+        context.clock = new Date('2026-09-17T13:30Z')
+        const unchanged = await holds.converge(
+            'h1',
+            hold => hold.unitId === 'u3',
+            { unitId: 'u3' },
+            existing => {
+                existing.unitId = 'u3'
+            },
+        )
+        assert.deepStrictEqual(unchanged, converged)
+    })
+
     it('should keep documents written before the expiry was declared', async () => {
         await using context = new TestContext()
         const holds = schema.tables(context).LegacyHolds.partition('s1')
@@ -537,6 +605,8 @@ describe('expiry', () => {
             key: 'h1',
             revision,
             document: { unitId: 'u1', validUntil: 'never' },
+            seq: 0,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
         assert.deepStrictEqual(await Array.fromAsync(holds.getAll(), r => r.document), [
             { unitId: 'u1', validUntil: 'never' },

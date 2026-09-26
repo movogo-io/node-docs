@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
-import type { Connection, TransactionItem } from './driver.js'
+import type { Connection, ReadOptions, TransactionItem, Written } from './driver.js'
 import { conflict, isNotFound } from './errors.js'
-import { expiryOf, getUnexpired } from './expiry.js'
+import { expiryOf, getUnexpired, isoOf } from './expiry.js'
 import { maxTransactionItems } from './transaction.js'
 
 // Separates the index key value from the owning row's partition and key in the
@@ -97,6 +97,10 @@ type Add = Extract<TransactionItem, { op: 'add' }>
 type Update = Extract<TransactionItem, { op: 'update' }>
 type Delete = Extract<TransactionItem, { op: 'delete' }>
 
+// A table without indexes is written through `add`, which answers what it
+// stored. An indexed table is written in a transaction, which answers nothing:
+// `seq` and `updatedAt` are then what the driver stores for a write over the
+// row read beforehand, `replaced` when the caller read it, or a read here.
 export async function addWithIndexes(
     c: Connection,
     table: string,
@@ -104,8 +108,8 @@ export async function addWithIndexes(
     key: string,
     document: StoredDocument,
     now: number,
-    leftover?: IndexEntry[],
-): Promise<Revision> {
+    replaced?: Replaced,
+): Promise<Written> {
     const expiry = expiryOf(table, document)
     if (!hasIndexes(table)) {
         return await c.add(table, partition, key, document, { now, ...expiry })
@@ -119,8 +123,9 @@ export async function addWithIndexes(
         newRevision: randomUUID(),
         ...expiry,
     }
-    await c.transact([item, ...(await addIndexItems(c, item, leftover))], { now })
-    return item.newRevision
+    const { entries, seq } = replaced ?? (await replacedByAdd(c, item))
+    await c.transact([item, ...addIndexItems(item, entries)], { now })
+    return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
 export async function updateWithIndexes(
@@ -131,8 +136,8 @@ export async function updateWithIndexes(
     revision: Revision,
     document: StoredDocument,
     now: number,
-    oldEntries?: IndexEntry[],
-): Promise<Revision> {
+    replaced?: Replaced,
+): Promise<Written> {
     const expiry = expiryOf(table, document)
     if (!hasIndexes(table)) {
         return await c.update(table, partition, key, revision, document, { now, ...expiry })
@@ -147,8 +152,10 @@ export async function updateWithIndexes(
         newRevision: randomUUID(),
         ...expiry,
     }
-    await c.transact([item, ...(await updateIndexItems(c, item, now, oldEntries))], { now })
-    return item.newRevision
+    const { entries, seq } =
+        replaced ?? replacedOf(table, partition, key, await existingRow(c, item, now))
+    await c.transact([item, ...updateIndexItems(item, entries)], { now })
+    return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
 export async function deleteWithIndexes(
@@ -182,9 +189,20 @@ export async function expandIndexOperations(
             }
             switch (item.op) {
                 case 'add':
-                    return [item, ...(await addIndexItems(c, item))]
+                    return [item, ...addIndexItems(item, (await replacedByAdd(c, item)).entries)]
                 case 'update':
-                    return [item, ...(await updateIndexItems(c, item, now))]
+                    return [
+                        item,
+                        ...updateIndexItems(
+                            item,
+                            indexEntriesOf(
+                                item.table,
+                                item.partition,
+                                item.key,
+                                (await existingRow(c, item, now)).document,
+                            ),
+                        ),
+                    ]
                 case 'delete':
                     return [item, ...(await deleteIndexItems(c, item, now))]
                 default:
@@ -202,36 +220,19 @@ export async function expandIndexOperations(
     return flat
 }
 
-async function addIndexItems(
-    c: Connection,
-    item: Add,
-    leftover?: IndexEntry[],
-): Promise<TransactionItem[]> {
+function addIndexItems(item: Add, oldEntries: IndexEntry[]): TransactionItem[] {
     const entries = indexEntriesOf(item.table, item.partition, item.key, item.document)
     return [
         ...putItems(entries, item.document, item.newRevision, item.expiresAt),
-        ...clearItems(leftover ?? (await leftoverEntries(c, item)), entries),
+        ...clearItems(oldEntries, entries),
     ]
 }
 
-async function updateIndexItems(
-    c: Connection,
-    item: Update,
-    now: number,
-    oldEntries?: IndexEntry[],
-): Promise<TransactionItem[]> {
-    const old =
-        oldEntries ??
-        indexEntriesOf(
-            item.table,
-            item.partition,
-            item.key,
-            (await existingRow(c, item, now)).document,
-        )
+function updateIndexItems(item: Update, oldEntries: IndexEntry[]): TransactionItem[] {
     const entries = indexEntriesOf(item.table, item.partition, item.key, item.document)
     return [
         ...putItems(entries, item.document, item.newRevision, item.expiresAt),
-        ...clearItems(old, entries),
+        ...clearItems(oldEntries, entries),
     ]
 }
 
@@ -277,46 +278,70 @@ function entryId(entry: IndexEntry) {
     return JSON.stringify([entry.table, entry.partition, entry.key])
 }
 
-// The entries an expired document under the same key left behind. A live one
-// makes the add conflict, so its entries are never cleared.
-export function leftoverEntriesOf(
+// The row a write replaces, as read before the write: its index entries, and
+// the `seq` the write stores over it. For an add that is the expired row under
+// the key, or nothing; a live one makes the add conflict, so its entries are
+// never cleared. A caller that lets a callback mutate the document in place
+// takes this before the callback runs, or the entries to clear are computed
+// from the document as it will be, and the ones it had are left behind.
+export type Replaced = { entries: IndexEntry[]; seq: number }
+
+export function replacedOf(
     table: string,
     partition: string,
     key: string,
-    expired: { document: StoredDocument } | undefined,
-) {
-    if (!expired) {
-        return []
+    row: { document: StoredDocument; seq: number } | undefined,
+): Replaced {
+    if (!row) {
+        return { entries: [], seq: 0 }
     }
-    return indexEntriesOf(table, partition, key, expired.document)
+    return { entries: indexEntriesOf(table, partition, key, row.document), seq: row.seq + 1 }
 }
 
-async function leftoverEntries(c: Connection, item: Add) {
+async function replacedByAdd(c: Connection, item: Add): Promise<Replaced> {
     try {
-        const { document } = await c.get(item.table, item.partition, item.key)
-        return indexEntriesOf(item.table, item.partition, item.key, document)
+        const row = await c.get(item.table, item.partition, item.key)
+        return replacedOf(item.table, item.partition, item.key, row)
     } catch (e) {
         if (isNotFound(e)) {
-            return []
+            return replacedOf(item.table, item.partition, item.key, undefined)
         }
         throw e
     }
 }
 
+// The row the write is about to replace, for the index entries it leaves
+// behind. A revision other than the caller's is either a lost race or a stale
+// read of a row this process wrote milliseconds earlier; only a consistent
+// read tells which, so one is spent before the write is called a conflict.
 async function existingRow(
     c: Connection,
     item: { table: string; partition: string; key: string; revision: Revision },
     now: number,
 ) {
-    try {
-        const row = await getUnexpired(c, item.table, item.partition, item.key, now)
-        if (row.revision === item.revision) {
-            return row
-        }
-    } catch (e) {
-        if (!isNotFound(e)) {
-            throw e
-        }
+    const row = await liveRow(c, item, now)
+    if (row !== undefined && row.revision === item.revision) {
+        return row
+    }
+    const fresh = await liveRow(c, item, now, { consistent: true })
+    if (fresh !== undefined && fresh.revision === item.revision) {
+        return fresh
     }
     throw conflict()
+}
+
+async function liveRow(
+    c: Connection,
+    item: { table: string; partition: string; key: string },
+    now: number,
+    options?: ReadOptions,
+) {
+    try {
+        return await getUnexpired(c, item.table, item.partition, item.key, now, options)
+    } catch (e) {
+        if (isNotFound(e)) {
+            return undefined
+        }
+        throw e
+    }
 }

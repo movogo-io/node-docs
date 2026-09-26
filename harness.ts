@@ -10,6 +10,9 @@ const otherTable = 'HarnessTestDocs2'
 // driver deleting expired rows lazily by wall-clock time (DynamoDB TTL) never
 // removes a row mid-case.
 const now = 4_000_000_000
+// What a write at `now`, and one at `now + 60`, stamps as `updatedAt`.
+const updatedAt = '2096-10-02T07:06:40.000Z'
+const updatedAtLater = '2096-10-02T07:07:40.000Z'
 
 export function harness(
     it: (message: string, runner: () => Promise<void>) => void,
@@ -41,13 +44,59 @@ export function harness(
         assert.deepStrictEqual((await c.docs.get(table, partition, key)).document, added)
     })
 
-    it('gets added', async () => {
+    it('answers a read asked to be consistent with the same rows as one that is not', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const addedRevision = await c.docs.add(table, partition, key, added, { now })
-        const { document, revision } = await c.docs.get(table, partition, key)
-        assert.deepStrictEqual(added, document)
-        assert.strictEqual(addedRevision, revision)
+        await c.docs.add(table, partition, key, added, { now })
+        assert.deepStrictEqual(
+            await c.docs.get(table, partition, key, { consistent: true }),
+            await c.docs.get(table, partition, key),
+        )
+        assert.deepStrictEqual(
+            await c.docs.get(table, partition, key, { consistent: false }),
+            await c.docs.get(table, partition, key),
+        )
+        if (c.docs.getMany) {
+            assert.deepStrictEqual(
+                await c.docs.getMany(table, [{ partition, key }], { consistent: true }),
+                await c.docs.getMany(table, [{ partition, key }]),
+            )
+        }
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition, undefined, { consistent: true }),
+            ),
+            await Array.fromAsync(c.docs.getPartition(table, partition)),
+        )
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                c.docs.getPartition(table, partition, { withPrefix: key }, { consistent: true }),
+            ),
+            await Array.fromAsync(c.docs.getPartition(table, partition, { withPrefix: key })),
+        )
+        assert.strictEqual(
+            (
+                await Array.fromAsync(
+                    c.docs.getPartition(table, partition, undefined, { consistent: true }),
+                )
+            ).length,
+            1,
+        )
+    })
+
+    it('gets added, as the add answered it', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const { revision, ...written } = await c.docs.add(table, partition, key, added, { now })
+        assert.deepStrictEqual(written, { seq: 0, updatedAt })
+        const row = { partition, key, revision, document: added, seq: 0, updatedAt }
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), row)
+        if (c.docs.getMany) {
+            assert.deepStrictEqual(await c.docs.getMany(table, [{ partition, key }]), [row])
+        }
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartition(table, partition)), [
+            { key, revision, document: added, seq: 0, updatedAt },
+        ])
     })
 
     it('gets JSON serialized', async () => {
@@ -63,31 +112,67 @@ export function harness(
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
         await c.docs.add(table, partition, key, added, { now })
-        await assert.rejects(c.docs.add(table, partition, key, added, { now }), isConflict)
+        const untouched = await c.docs.get(table, partition, key)
+        await assert.rejects(
+            c.docs.add(table, partition, key, aDocument(), { now: now + 60 }),
+            isConflict,
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), untouched)
     })
 
-    it('gets updated', async () => {
+    it('gets updated, as the update answered it', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const addedRevision = await c.docs.add(table, partition, key, added, { now })
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
         const updated = aDocument()
-        const updatedRevision = await c.docs.update(table, partition, key, addedRevision, updated, {
-            now,
+        const { revision: updatedRevision, ...written } = await c.docs.update(
+            table,
+            partition,
+            key,
+            addedRevision,
+            updated,
+            { now },
+        )
+        assert.deepStrictEqual(written, { seq: 1, updatedAt })
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: updatedRevision,
+            document: updated,
+            seq: 1,
+            updatedAt,
         })
-        const { document, revision } = await c.docs.get(table, partition, key)
-        assert.deepStrictEqual(updated, document)
-        assert.strictEqual(updatedRevision, revision)
+        const again = aDocument()
+        const { revision: againRevision, ...writtenAgain } = await c.docs.update(
+            table,
+            partition,
+            key,
+            updatedRevision,
+            again,
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(writtenAgain, { seq: 2, updatedAt: updatedAtLater })
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: againRevision,
+            document: again,
+            seq: 2,
+            updatedAt: updatedAtLater,
+        })
     })
 
     it('rejects updating updated', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const addedRevision = await c.docs.add(table, partition, key, added, { now })
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
         await c.docs.update(table, partition, key, addedRevision, aDocument(), { now })
+        const untouched = await c.docs.get(table, partition, key)
         await assert.rejects(
-            c.docs.update(table, partition, key, addedRevision, aDocument(), { now }),
+            c.docs.update(table, partition, key, addedRevision, aDocument(), { now: now + 60 }),
             isConflict,
         )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), untouched)
     })
 
     it('gets empty range', async () => {
@@ -199,23 +284,144 @@ export function harness(
         }
     })
 
-    it('deletes added', async () => {
+    it('deletes added from every read', async () => {
+        const { partition, key, document: added } = aRow()
+        const keptKey = anId()
+        const kept = aDocument()
+        await using c = await connect(driver, contextFactory)
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
+        const { revision: keptRevision } = await c.docs.add(table, partition, keptKey, kept, {
+            now,
+        })
+        await c.docs.delete(table, partition, key, addedRevision, { now })
+        await assert.rejects(c.docs.get(table, partition, key), isNotFound)
+        await assert.rejects(c.docs.get(table, partition, key, { consistent: true }), isNotFound)
+        if (c.docs.getMany) {
+            assert.deepStrictEqual(
+                await c.docs.getMany(table, [
+                    { partition, key },
+                    { partition, key: keptKey },
+                ]),
+                [
+                    {
+                        partition,
+                        key: keptKey,
+                        revision: keptRevision,
+                        document: kept,
+                        seq: 0,
+                        updatedAt,
+                    },
+                ],
+            )
+        }
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartition(table, partition)), [
+            { key: keptKey, revision: keptRevision, document: kept, seq: 0, updatedAt },
+        ])
+        assert.deepStrictEqual(
+            await Array.fromAsync(c.docs.getPartition(table, partition, { withPrefix: key })),
+            [],
+        )
+    })
+
+    it('leaves a partition out of the partitions once its last row is deleted', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const addedRevision = await c.docs.add(table, partition, key, added, { now })
-        await c.docs.delete(table, partition, key, addedRevision, { now })
+        const { revision } = await c.docs.add(table, partition, key, added, { now })
+        assert.ok((await Array.fromAsync(c.docs.getPartitions(table))).includes(partition))
+        await c.docs.delete(table, partition, key, revision, { now })
+        assert.ok(!(await Array.fromAsync(c.docs.getPartitions(table))).includes(partition))
+    })
+
+    it('conflicts on updating, deleting and checking a deleted row', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const { revision } = await c.docs.add(table, partition, key, added, { now })
+        await c.docs.delete(table, partition, key, revision, { now })
+        await assert.rejects(
+            c.docs.update(table, partition, key, revision, aDocument(), { now }),
+            isConflict,
+        )
+        await assert.rejects(c.docs.delete(table, partition, key, revision, { now }), isConflict)
+        await assert.rejects(
+            c.docs.transact([{ op: 'check', table, partition, key, revision }], { now }),
+            isConflict,
+        )
         await assert.rejects(c.docs.get(table, partition, key), isNotFound)
     })
 
-    it('re-adds deleted', async () => {
+    it('re-adds deleted, starting its count afresh', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const addedRevision = await c.docs.add(table, partition, key, added, { now })
-        await c.docs.delete(table, partition, key, addedRevision, { now })
-        const reAddedRevision = await c.docs.add(table, partition, key, added, { now })
-        const { document, revision } = await c.docs.get(table, partition, key)
-        assert.deepStrictEqual(added, document)
-        assert.strictEqual(reAddedRevision, revision)
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
+        const { revision: updatedRevision } = await c.docs.update(
+            table,
+            partition,
+            key,
+            addedRevision,
+            added,
+            { now },
+        )
+        await c.docs.delete(table, partition, key, updatedRevision, { now })
+        const { revision, ...written } = await c.docs.add(table, partition, key, added, {
+            now: now + 60,
+        })
+        assert.deepStrictEqual(written, { seq: 0, updatedAt: updatedAtLater })
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision,
+            document: added,
+            seq: 0,
+            updatedAt: updatedAtLater,
+        })
+    })
+
+    it('adds and puts over transacted deletes and clears, starting the count afresh', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
+        await c.docs.transact([{ op: 'delete', table, partition, key, revision: addedRevision }], {
+            now,
+        })
+        await assert.rejects(c.docs.get(table, partition, key), isNotFound)
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartition(table, partition)), [])
+        const reAddedRevision = anId()
+        await c.docs.transact(
+            [{ op: 'add', table, partition, key, document: added, newRevision: reAddedRevision }],
+            { now },
+        )
+        const { revision: updatedRevision } = await c.docs.update(
+            table,
+            partition,
+            key,
+            reAddedRevision,
+            added,
+            { now },
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: updatedRevision,
+            document: added,
+            seq: 1,
+            updatedAt,
+        })
+        await c.docs.transact([{ op: 'clear', table, partition, key }], { now })
+        await assert.rejects(c.docs.get(table, partition, key), isNotFound)
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartition(table, partition)), [])
+        const putRevision = anId()
+        await c.docs.transact(
+            [{ op: 'put', table, partition, key, document: added, newRevision: putRevision }],
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: putRevision,
+            document: added,
+            seq: 0,
+            updatedAt: updatedAtLater,
+        })
     })
 
     it('transacts adds across tables', async () => {
@@ -291,9 +497,16 @@ export function harness(
         const { partition, key, document: added } = aRow()
         const secondKey = anId()
         await using c = await connect(driver, contextFactory)
-        const staleRevision = await c.docs.add(table, partition, key, added, { now })
-        const secondRevision = await c.docs.add(table, partition, secondKey, aDocument(), { now })
+        const { revision: staleRevision } = await c.docs.add(table, partition, key, added, { now })
+        const { revision: secondRevision } = await c.docs.add(
+            table,
+            partition,
+            secondKey,
+            aDocument(),
+            { now },
+        )
         await c.docs.update(table, partition, key, staleRevision, aDocument(), { now })
+        const conflicting = await c.docs.get(table, partition, key)
         const untouched = await c.docs.get(table, partition, secondKey)
         await assert.rejects(
             c.docs.transact(
@@ -317,10 +530,11 @@ export function harness(
                         newRevision: anId(),
                     },
                 ],
-                { now },
+                { now: now + 60 },
             ),
             isConflict,
         )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), conflicting)
         assert.deepStrictEqual(await c.docs.get(table, partition, secondKey), untouched)
     })
 
@@ -329,10 +543,22 @@ export function harness(
         const updateKey = anId()
         const deleteKey = anId()
         await using c = await connect(driver, contextFactory)
-        const updateRevision = await c.docs.add(table, partition, updateKey, aDocument(), { now })
-        const deleteRevision = await c.docs.add(otherTable, partition, deleteKey, aDocument(), {
-            now,
-        })
+        const { revision: updateRevision } = await c.docs.add(
+            table,
+            partition,
+            updateKey,
+            aDocument(),
+            { now },
+        )
+        const { revision: deleteRevision } = await c.docs.add(
+            otherTable,
+            partition,
+            deleteKey,
+            aDocument(),
+            {
+                now,
+            },
+        )
         const addedRevision = anId()
         const updated = aDocument()
         const updatedRevision = anId()
@@ -369,7 +595,7 @@ export function harness(
         const { partition, key, document: added } = aRow()
         const otherKey = anId()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, { now })
+        const { revision } = await c.docs.add(table, partition, key, added, { now })
         await c.docs.transact(
             [
                 { op: 'check', table, partition, key, revision },
@@ -393,7 +619,7 @@ export function harness(
         const { partition, key, document: added } = aRow()
         const otherKey = anId()
         await using c = await connect(driver, contextFactory)
-        const staleRevision = await c.docs.add(table, partition, key, added, { now })
+        const { revision: staleRevision } = await c.docs.add(table, partition, key, added, { now })
         await c.docs.update(table, partition, key, staleRevision, aDocument(), { now })
         await assert.rejects(
             c.docs.transact(
@@ -446,9 +672,15 @@ export function harness(
             [{ op: 'add', table, partition, key, document: added, newRevision: revision }],
             { now },
         )
-        const updatedRevision = await c.docs.update(table, partition, key, revision, aDocument(), {
-            now,
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision,
+            document: added,
+            seq: 0,
+            updatedAt,
         })
+        const updated = aDocument()
         const transactionRevision = anId()
         await c.docs.transact(
             [
@@ -457,14 +689,38 @@ export function harness(
                     table,
                     partition,
                     key,
-                    revision: updatedRevision,
-                    document: aDocument(),
+                    revision,
+                    document: updated,
                     newRevision: transactionRevision,
                 },
             ],
             { now },
         )
-        assert.strictEqual((await c.docs.get(table, partition, key)).revision, transactionRevision)
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: transactionRevision,
+            document: updated,
+            seq: 1,
+            updatedAt,
+        })
+        const again = aDocument()
+        const { revision: updatedRevision } = await c.docs.update(
+            table,
+            partition,
+            key,
+            transactionRevision,
+            again,
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: updatedRevision,
+            document: again,
+            seq: 2,
+            updatedAt: updatedAtLater,
+        })
     })
 
     it('puts documents unconditionally', async () => {
@@ -475,32 +731,71 @@ export function harness(
             [{ op: 'put', table, partition, key, document: first, newRevision: firstRevision }],
             { now },
         )
-        const added = await c.docs.get(table, partition, key)
-        assert.deepStrictEqual(added.document, first)
-        assert.strictEqual(added.revision, firstRevision)
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: firstRevision,
+            document: first,
+            seq: 0,
+            updatedAt,
+        })
         const second = aDocument()
         const secondRevision = anId()
         await c.docs.transact(
             [{ op: 'put', table, partition, key, document: second, newRevision: secondRevision }],
-            { now },
+            { now: now + 60 },
         )
-        const replaced = await c.docs.get(table, partition, key)
-        assert.deepStrictEqual(replaced.document, second)
-        assert.strictEqual(replaced.revision, secondRevision)
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: secondRevision,
+            document: second,
+            seq: 1,
+            updatedAt: updatedAtLater,
+        })
     })
 
-    it('clears present and absent documents', async () => {
+    it('puts over an added row, continuing its count', async () => {
         const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, { now })
+        await c.docs.update(table, partition, key, addedRevision, added, { now })
+        const put = aDocument()
+        const putRevision = anId()
+        await c.docs.transact(
+            [{ op: 'put', table, partition, key, document: put, newRevision: putRevision }],
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: putRevision,
+            document: put,
+            seq: 2,
+            updatedAt: updatedAtLater,
+        })
+    })
+
+    it('clears present and absent documents, leaving nothing behind', async () => {
+        const { partition, key, document: added } = aRow()
+        const unwrittenPartition = anId()
         await using c = await connect(driver, contextFactory)
         await c.docs.add(table, partition, key, added, { now })
         await c.docs.transact(
             [
                 { op: 'clear', table, partition, key },
                 { op: 'clear', table, partition, key: anId() },
+                { op: 'clear', table, partition: unwrittenPartition, key: anId() },
             ],
             { now },
         )
         await assert.rejects(c.docs.get(table, partition, key), isNotFound)
+        assert.deepStrictEqual(await Array.fromAsync(c.docs.getPartition(table, partition)), [])
+        assert.deepStrictEqual(
+            await Array.fromAsync(c.docs.getPartition(table, unwrittenPartition)),
+            [],
+        )
+        assert.ok(!(await Array.fromAsync(c.docs.getPartitions(table))).includes(partition))
     })
 
     it('transacts nothing when puts and clears accompany a failing check', async () => {
@@ -508,9 +803,10 @@ export function harness(
         const putKey = anId()
         const clearKey = anId()
         await using c = await connect(driver, contextFactory)
-        const staleRevision = await c.docs.add(table, partition, key, added, { now })
+        const { revision: staleRevision } = await c.docs.add(table, partition, key, added, { now })
         await c.docs.update(table, partition, key, staleRevision, aDocument(), { now })
         await c.docs.add(table, partition, clearKey, aDocument(), { now })
+        const checked = await c.docs.get(table, partition, key)
         const untouched = await c.docs.get(table, partition, clearKey)
         await assert.rejects(
             c.docs.transact(
@@ -526,12 +822,13 @@ export function harness(
                     { op: 'clear', table, partition, key: clearKey },
                     { op: 'check', table, partition, key, revision: staleRevision },
                 ],
-                { now },
+                { now: now + 60 },
             ),
             isConflict,
         )
         await assert.rejects(c.docs.get(table, partition, putKey), isNotFound)
         assert.deepStrictEqual(await c.docs.get(table, partition, clearKey), untouched)
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), checked)
     })
 
     it('ranges keys containing the reserved separator', async () => {
@@ -584,7 +881,7 @@ export function harness(
     it('gets expired rows raw with their expiry', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
@@ -593,6 +890,8 @@ export function harness(
             key,
             revision,
             document: added,
+            seq: 0,
+            updatedAt,
             expiresAt: now + 60,
         })
         assert.deepStrictEqual(
@@ -610,11 +909,17 @@ export function harness(
         if (!c.docs.getMany) {
             return
         }
-        const firstRevision = await c.docs.add(table, first.partition, first.key, first.document, {
-            now,
-            expiresAt: now + 60,
-        })
-        const secondRevision = await c.docs.add(
+        const { revision: firstRevision } = await c.docs.add(
+            table,
+            first.partition,
+            first.key,
+            first.document,
+            {
+                now,
+                expiresAt: now + 60,
+            },
+        )
+        const { revision: secondRevision } = await c.docs.add(
             table,
             second.partition,
             second.key,
@@ -634,6 +939,8 @@ export function harness(
                     key: first.key,
                     revision: firstRevision,
                     document: first.document,
+                    seq: 0,
+                    updatedAt,
                     expiresAt: now + 60,
                 },
                 {
@@ -641,6 +948,8 @@ export function harness(
                     key: second.key,
                     revision: secondRevision,
                     document: second.document,
+                    seq: 0,
+                    updatedAt,
                 },
             ].toSorted((a, b) => a.partition.localeCompare(b.partition)),
         )
@@ -654,7 +963,10 @@ export function harness(
         const empty = anId()
         const rows = Array.from({ length: 101 }, () => aRow())
         const revisions = await Promise.all(
-            rows.map(r => c.docs.add(table, r.partition, r.key, r.document, { now })),
+            rows.map(
+                async r =>
+                    (await c.docs.add(table, r.partition, r.key, r.document, { now })).revision,
+            ),
         )
         const found = await c.docs.getMany(table, [
             { partition: empty, key: anId() },
@@ -668,6 +980,8 @@ export function harness(
                     key: r.key,
                     revision: revisions[i],
                     document: r.document,
+                    seq: 0,
+                    updatedAt,
                 }))
                 .toSorted((a, b) => a.partition.localeCompare(b.partition)),
         )
@@ -693,24 +1007,36 @@ export function harness(
         )
     })
 
-    it('adds over an expired row', async () => {
+    it('adds over an expired row, continuing its count', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        await c.docs.add(table, partition, key, added, { now, expiresAt: now + 60 })
+        const { revision: addedRevision } = await c.docs.add(table, partition, key, added, {
+            now,
+            expiresAt: now + 60,
+        })
+        await c.docs.update(table, partition, key, addedRevision, added, {
+            now,
+            expiresAt: now + 60,
+        })
         const replacement = aDocument()
-        const revision = await c.docs.add(table, partition, key, replacement, { now: now + 60 })
+        const { revision, ...written } = await c.docs.add(table, partition, key, replacement, {
+            now: now + 60,
+        })
+        assert.deepStrictEqual(written, { seq: 2, updatedAt: updatedAtLater })
         assert.deepStrictEqual(await c.docs.get(table, partition, key), {
             partition,
             key,
             revision,
             document: replacement,
+            seq: 2,
+            updatedAt: updatedAtLater,
         })
     })
 
     it('rejects updating and deleting an expired row', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
@@ -728,11 +1054,11 @@ export function harness(
     it('updates the expiry of a row', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
-        const extended = await c.docs.update(table, partition, key, revision, added, {
+        const { revision: extended } = await c.docs.update(table, partition, key, revision, added, {
             now,
             expiresAt: now + 120,
         })
@@ -746,10 +1072,16 @@ export function harness(
         const checkedKey = anId()
         await using c = await connect(driver, contextFactory)
         await c.docs.add(table, partition, key, added, { now, expiresAt: now + 60 })
-        const checkedRevision = await c.docs.add(table, partition, checkedKey, aDocument(), {
-            now,
-            expiresAt: now + 60,
-        })
+        const { revision: checkedRevision } = await c.docs.add(
+            table,
+            partition,
+            checkedKey,
+            aDocument(),
+            {
+                now,
+                expiresAt: now + 60,
+            },
+        )
         await assert.rejects(
             c.docs.transact(
                 [{ op: 'check', table, partition, key: checkedKey, revision: checkedRevision }],
@@ -778,6 +1110,8 @@ export function harness(
             key,
             revision,
             document: replacement,
+            seq: 1,
+            updatedAt: updatedAtLater,
             expiresAt: now + 120,
         })
     })
@@ -811,7 +1145,7 @@ export function harness(
         const { partition, key, document: added } = aRow()
         const siblingKey = anId()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
@@ -847,7 +1181,7 @@ export function harness(
         const { partition, key, document: added } = aRow()
         const siblingKey = anId()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
@@ -874,7 +1208,7 @@ export function harness(
     it('transacts updates of the expiry', async () => {
         const { partition, key, document: added } = aRow()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
@@ -915,6 +1249,8 @@ export function harness(
             key,
             revision: cleared,
             document: added,
+            seq: 2,
+            updatedAt,
         })
     })
 
@@ -924,14 +1260,20 @@ export function harness(
         const otherKey = anId()
         const other = aDocument()
         await using c = await connect(driver, contextFactory)
-        const revision = await c.docs.add(table, partition, key, added, {
+        const { revision } = await c.docs.add(table, partition, key, added, {
             now,
             expiresAt: now + 60,
         })
-        const checkedRevision = await c.docs.add(table, partition, checkedKey, aDocument(), {
-            now,
-            expiresAt: now + 60,
-        })
+        const { revision: checkedRevision } = await c.docs.add(
+            table,
+            partition,
+            checkedKey,
+            aDocument(),
+            {
+                now,
+                expiresAt: now + 60,
+            },
+        )
         await c.docs.transact(
             [
                 { op: 'check', table, partition, key: checkedKey, revision: checkedRevision },
@@ -985,6 +1327,8 @@ export function harness(
             key,
             revision,
             document: added,
+            seq: 0,
+            updatedAt,
             expiresAt: now + 60,
         })
         assert.deepStrictEqual(await c.docs.get(table, partition, otherKey), {
@@ -992,6 +1336,8 @@ export function harness(
             key: otherKey,
             revision: otherRevision,
             document: other,
+            seq: 0,
+            updatedAt,
         })
     })
 }

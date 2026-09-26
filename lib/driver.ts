@@ -1,6 +1,14 @@
+import { createRequire } from 'node:module'
 import type { KeyRange, Revision, Row, StoredDocument } from '../schema.js'
 
 export type Context = object
+
+// Options of a read. `consistent: true` asks for a read that sees every write
+// acknowledged before it began, for a caller that reads back a row it wrote
+// milliseconds earlier and decides on what it sees (a lease claim, a fencing
+// check). A driver that cannot honour it ignores it; one that can may charge
+// more for it, so callers ask per read rather than by default.
+export type ReadOptions = { consistent?: boolean }
 
 export type Driver = {
     connect: (context: Context) => Promise<Connection>
@@ -9,7 +17,15 @@ export type Driver = {
 // Times handed to drivers are integer epoch seconds. A row whose stored
 // `expiresAt` is at or before the `now` of the operation is expired: `add` and
 // `put` overwrite it as if it were missing, while `update`, `delete`, and
-// `check` conflict on it. `put` and `clear` ignore `now`.
+// `check` conflict on it. `put` stamps `updatedAt` from `now` like the other
+// writes; only `clear` ignores it.
+//
+// Every write stores `seq`: 0 when no row is under the key, the row's `seq` + 1
+// otherwise, live or expired. `delete` and `clear` remove the row, so a re-add
+// of the key starts at 0 again. `add` and `update` answer the revision, `seq`
+// and `updatedAt` they stored; a transaction answers nothing, so the store
+// works them out from the row it read before writing, which is what the driver
+// stores unless it removed an expired row between the read and the write.
 //
 // Writes omit `expiresAt` for a row that never expires, and an `update` or
 // `put` without it clears any stored expiry. Any integer is a valid expiry,
@@ -70,6 +86,9 @@ export type TransactionItem =
           key: string
       }
 
+// What `add` and `update` stored, as `get` would read it back.
+export type Written = { revision: Revision; seq: number; updatedAt: string }
+
 export type Connection = {
     close: () => Promise<void>
     add: (
@@ -78,11 +97,12 @@ export type Connection = {
         key: string,
         document: StoredDocument,
         options: { now: number; expiresAt?: number },
-    ) => Promise<Revision>
+    ) => Promise<Written>
     get: (
         table: string,
         partition: string,
         key: string,
+        options?: ReadOptions,
     ) => Promise<Row<StoredDocument> & { partition: string; key: string; expiresAt?: number }>
     // The rows among `refs` that exist, in any order, raw like `get`; a
     // missing one is simply absent. `refs` is non-empty, distinct, and may
@@ -95,16 +115,20 @@ export type Connection = {
     getMany?: (
         table: string,
         refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
     ) => Promise<(Row<StoredDocument> & { partition: string; key: string; expiresAt?: number })[]>
     getPartitions: (table: string) => AsyncIterable<string>
     getPartition: (
         table: string,
         partition: string,
         keyRange?: KeyRange,
+        options?: ReadOptions,
     ) => AsyncIterable<{
         key: string
         revision: Revision
         document: StoredDocument
+        seq: number
+        updatedAt: string
         expiresAt?: number
     }>
     update: (
@@ -114,7 +138,7 @@ export type Connection = {
         revision: Revision,
         document: StoredDocument,
         options: { now: number; expiresAt?: number },
-    ) => Promise<Revision>
+    ) => Promise<Written>
     delete: (
         table: string,
         partition: string,
@@ -125,11 +149,35 @@ export type Connection = {
     transact: (items: TransactionItem[], options: { now: number }) => Promise<void>
 }
 
+// The driver, its decorators and the index and expiry registries live in this
+// module's scope, so a second copy of the package in one process would split
+// them: writes through one copy bypass the other's decorators and indexes. The
+// first copy loaded claims the process; a later one refuses to load.
+function claimProcess() {
+    const claim = Symbol.for('@movogo-io/docs')
+    const copy = {
+        version: String(
+            (createRequire(import.meta.url)('../package.json') as { version: unknown }).version,
+        ),
+        url: import.meta.url,
+    }
+    const claimed = (globalThis as { [claim]?: { version: string; url: string } })[claim]
+    if (claimed !== undefined) {
+        throw new Error(
+            `Two copies of @movogo-io/docs are loaded: ${copy.version} at ${copy.url} and ${claimed.version} at ${claimed.url}. The service and every package must resolve to one copy; check the peer dependency pins.`,
+        )
+    }
+    Reflect.set(globalThis, claim, copy)
+    return copy
+}
+
 const state: {
+    copy: { version: string; url: string }
     driver: Driver
     decorators: ((driver: Driver) => Driver)[]
     decorated?: Driver
 } = {
+    copy: claimProcess(),
     driver: {
         connect: () =>
             Promise.reject<Connection>(new Error('No driver set, please call setDriver()')),

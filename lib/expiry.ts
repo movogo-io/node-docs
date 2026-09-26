@@ -1,5 +1,5 @@
 import type { StoredDocument } from '../schema.js'
-import type { Connection } from './driver.js'
+import type { Connection, ReadOptions } from './driver.js'
 import { isNotFound, notFound } from './errors.js'
 
 const registry = new Map<string, (document: StoredDocument) => Date | undefined>()
@@ -44,8 +44,9 @@ export async function getUnexpired(
     partition: string,
     key: string,
     nowSeconds: number,
+    options?: ReadOptions,
 ) {
-    const { live } = await getRow(c, table, partition, key, nowSeconds)
+    const { live } = await getRow(c, table, partition, key, nowSeconds, options)
     if (!live) {
         throw notFound()
     }
@@ -58,8 +59,9 @@ export async function findUnexpired(
     partition: string,
     key: string,
     nowSeconds: number,
+    options?: ReadOptions,
 ) {
-    const { live } = await getRow(c, table, partition, key, nowSeconds)
+    const { live } = await getRow(c, table, partition, key, nowSeconds, options)
     return live
 }
 
@@ -70,13 +72,14 @@ export async function findEachUnexpired(
     table: string,
     refs: readonly { partition: string; key: string }[],
     nowSeconds: number,
+    options?: ReadOptions,
 ) {
     const distinct = new Map(refs.map(ref => [refKey(ref), ref])).values().toArray()
     if (distinct.length === 0) {
         return []
     }
     const live = new Map<string, LiveRow>()
-    for (const { expiresAt, ...row } of await getManyRaw(c, table, distinct)) {
+    for (const { expiresAt, ...row } of await getManyRaw(c, table, distinct, options)) {
         if (!isExpired(expiresAt, nowSeconds)) {
             live.set(refKey(row), row)
         }
@@ -102,23 +105,29 @@ async function getManyRaw(
     c: Connection,
     table: string,
     refs: readonly { partition: string; key: string }[],
+    options?: ReadOptions,
 ) {
     if (c.getMany) {
-        return await c.getMany(table, refs)
+        return await c.getMany(table, refs, options)
     }
     const rows: Awaited<ReturnType<Connection['get']>>[] = []
     for (let start = 0; start < refs.length; start += readsInFlightMax) {
         const chunk = await Promise.all(
-            refs.slice(start, start + readsInFlightMax).map(ref => getRaw(c, table, ref)),
+            refs.slice(start, start + readsInFlightMax).map(ref => getRaw(c, table, ref, options)),
         )
         rows.push(...chunk.filter(row => row !== undefined))
     }
     return rows
 }
 
-async function getRaw(c: Connection, table: string, ref: { partition: string; key: string }) {
+async function getRaw(
+    c: Connection,
+    table: string,
+    ref: { partition: string; key: string },
+    options?: ReadOptions,
+) {
     try {
-        return await c.get(table, ref.partition, ref.key)
+        return await c.get(table, ref.partition, ref.key, options)
     } catch (e) {
         if (isNotFound(e)) {
             return undefined
@@ -133,9 +142,10 @@ export async function getRow(
     partition: string,
     key: string,
     nowSeconds: number,
+    options?: ReadOptions,
 ) {
     try {
-        const { expiresAt, ...row } = await c.get(table, partition, key)
+        const { expiresAt, ...row } = await c.get(table, partition, key, options)
         if (isExpired(expiresAt, nowSeconds)) {
             return { expired: row }
         }
@@ -165,4 +175,8 @@ function isExpired(expiresAt: number | undefined, nowSeconds: number) {
 
 function epochSeconds(date: Date) {
     return Math.floor(date.getTime() / 1000)
+}
+
+export function isoOf(seconds: number) {
+    return new Date(seconds * 1000).toISOString()
 }

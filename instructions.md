@@ -4,7 +4,7 @@ This package provides **document**-based cloud **persistence** with **optimistic
 
 ## High-level
 
-Documents are stored in tables with a partition key and sort key. A document can be retrieved by specifying a partition and key. When retrieving or adding a document, a revision is also returned. If the document needs to be updated or deleted, that revision needs to be provided. If the document has changed in the meantime, an conflict error will be thrown.
+Documents are stored in tables with a partition key and sort key. A document can be retrieved by specifying a partition and key. When retrieving or adding a document, a revision is also returned. If the document needs to be updated or deleted, that revision needs to be provided. If the document has changed in the meantime, an conflict error will be thrown. Every row read also carries `seq`, a per-key write counter (0 on the first add, +1 per later write, an add over an expired row included; a delete removes the count, so a re-add of the key starts at 0 again), and `updatedAt`, the ISO instant of the last write at second precision from the clock of the context; `seq` orders the writes of a key, `updatedAt` only dates them.
 
 The use of this package is an **implementation detail**. **DO NOT** use it from tests. Only use the package's entry point from tests.
 
@@ -56,6 +56,8 @@ type Schema = {
 };
 ```
 
+Table names follow one convention across the platform: a table a platform package manages carries a leading underscore (`_idempotency` of `@movogo-io/idempotency`, `_sagas` of `@movogo-io/sagas`), and a dot introduces only a shadow table the store or a package maintains for a table — an index shadow `<Table>.<index>` or the audit shadow `<Table>._audit`. A service never declares a leading-underscore table itself, and never a name with a dot, so its own tables cannot collide with a package's, and an operator reading the console can tell them apart.
+
 ## Table Access
 
 The schema is then used with the `tables` functions taking the @riddance/service context, like this:
@@ -104,10 +106,18 @@ type DocumentSet<Document> = {
     ) => Promise<Row<Document>>;
     delete: (key: string, revision: Revision) => Promise<void>;
 };
-type Row<Document> = { key: string; revision: Revision; document: Document };
+type Row<Document> = {
+    key: string;
+    revision: Revision;
+    document: Document;
+    seq: number; // 0 on the add that creates the row; previous + 1 on every later write, an add over an expired row included; 0 again after a delete
+    updatedAt: string; // ISO instant of the last write, second precision
+};
 ```
 
 `get` throws not found; `find` answers `undefined` instead, for the callers to whom absence is a normal case — an existence probe, an optional relation, an event handler for which a document that is gone is a state to skip. `get` stays the default: a `find` whose caller forgets the `undefined` branch becomes a 500, or an accidental default, far from the read.
+
+Every read (`get`, `getDocument`, `find`, `findEach`, `getAll`, `getRange`) takes an optional trailing `{ consistent: true }`. It asks the driver for a read that sees every write acknowledged before it began; the in-memory driver is consistent by construction and ignores it, the DynamoDB driver sends a strongly consistent read, at twice the read cost. Ask for it only where the caller reads back a row it wrote milliseconds earlier and decides on what it sees — a lease claim, a fencing check, a revision it is about to write against — never as a default. The retry helpers (`getOrAdd`, `addOrUpdate`, `converge` and their `Computed` forms) accept `consistent` in their options object, for the read they make before they write.
 
 `findEach` resolves a list of keys. The result follows the order of `keys`, holds each distinct key at most once, and leaves out a key whose document is missing or expired — an index row can outlive the document it points at, and a list read from a lagging replica can still name one a delete has removed. A driver without a batch read pays one round trip per key and, on a cold connection, one TLS connection per read in flight — an unbounded `Promise.all` over a tenant-sized list has failed a production request outright with `getaddrinfo EBUSY` — so the store then reads at most 16 at a time. So a service neither writes the chunked loop itself nor the `for … await get` ladder it replaces; it calls `findEach`, and a driver with a batch read serves the whole list in as few calls as its batch limit allows. On `withKey` sets, `find` and `findEach` take partitions, like `get` does.
 
@@ -199,7 +209,7 @@ await withTransaction<Schema>(context, async (tx) => {
 The `tx` argument mirrors the `tables` surface with these rules:
 
 - **Writes are buffered.** `add`, `update`, `updateRow`, `check`, and `delete` do not touch storage when called; they are queued and applied atomically when the callback resolves. Returned revisions are final and usable after the commit.
-- **Reads return committed state.** `get`, `getDocument`, `find`, `findEach`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction.
+- **Reads return committed state.** `get`, `getDocument`, `find`, `findEach`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction. They take the same trailing `{ consistent: true }` as outside a transaction, for a revision check the transaction's own conditions must not mistake for a lost race.
 - **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
 - **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried.
 - **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
@@ -258,11 +268,11 @@ Rules and properties:
 
 - **Declare before the first write.** Writes consult the registered definitions, so `schema.index` calls must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
 - **Maintenance is atomic.** Every write to an indexed table (including the retry helpers and writes inside `withTransaction`) commits the document and its index entries in one transaction; a document can never be observed missing from, or stale in, an index. Reads are as consistent as the main table.
-- **Index rows carry the document and its revision.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`.
-- **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table.
+- **Index rows carry the document and its revision, but not `seq` or `updatedAt`.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`. An entry keeps its own write counter, which is not the source document's, so neither is exposed; read the document itself for its `seq`.
+- **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table. Both, and `firstDocument`, take the trailing `{ consistent: true }` of a table read.
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
 - **Extractors must handle every document shape ever stored.** A write computes the entries of the document it replaces, including an expired one under the same key, so an extractor that throws on a legacy shape makes `add`, `update`, and `delete` of that key fail.
-- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
+- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. That read is eventual; a revision other than the caller's is read again consistently before the write is called a conflict, so a row this process updated milliseconds earlier does not fail its own next update on a stale replica. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
 - **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
 
 ## Expiry
@@ -310,3 +320,11 @@ decorateDriver((driver: Driver) => wrapped(driver));
 ```
 
 Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget. `getMany` is optional on a connection: a decorator that lists the methods it forwards and leaves it out turns every `findEach` beneath it into single reads, 16 at a time, which is correct but forfeits the driver's batch read — forward it when the wrapped connection has one.
+
+A decorator must forward the trailing read options of `get`, `getMany` and `getPartition` to the wrapped connection; one that drops them makes every read beneath it silently lose the consistency it asked for.
+
+The driver, its decorators and the index and expiry registries are module state, so one process must hold one copy of this package: the first copy loaded claims `globalThis[Symbol.for('@movogo-io/docs')]`, and a second copy refuses to load with an error naming both versions and paths, which turns a nested duplicate under a mis-pinned package into a failing test run instead of writes that silently bypass auditing and indexes.
+
+## Test drivers
+
+`@movogo-io/docs/test/memory` ships in-memory drivers for tests, all implementing the connection contract: `MemoryDriver` keeps one store per context, `PersistentMemoryDriver` one store per driver instance with a closable connection per `connect()`, as DynamoDB connections are, and `DelayedPersistentMemoryDriver` the same with a random sub-millisecond delay on every operation, so interleavings a synchronous store would never produce do show up. `LaggingPersistentMemoryDriver` models eventual consistency deterministically: the first read of a row without `{ consistent: true }` after a write to it sees the row as it was before that write (present, absent or expired), every later read and every consistent read sees the write. Run the flows that read back what they just wrote under it, so a read that needed `{ consistent: true }` fails in the test run rather than once a second on DynamoDB. `@movogo-io/docs/test/mock` is the mocha root hook that installs a fresh `PersistentMemoryDriver` before each test.

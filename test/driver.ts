@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { decorateDriver, setDriver, type Connection, type Driver } from '../driver.js'
 import { MemoryDriver } from '../memory.js'
 import { tables } from '../partitioned.js'
@@ -59,6 +62,20 @@ describe('driver decoration', () => {
         assert.deepStrictEqual(seen, ['kept add DecoratedDocs'])
     })
 
+    it('refuses to load beside another copy of the package', async () => {
+        const { code, stderr } = await loadInChild(
+            "globalThis[Symbol.for('@movogo-io/docs')] = { version: '9.9.9', url: 'file:///elsewhere/lib/driver.js' };",
+        )
+        assert.notStrictEqual(code, 0)
+        assert.match(stderr, /Two copies of @movogo-io\/docs are loaded/u)
+        assert.match(stderr, /9\.9\.9 at file:\/\/\/elsewhere\/lib\/driver\.js/u)
+    })
+
+    it('loads alone in a fresh process', async () => {
+        const { code, stderr } = await loadInChild('')
+        assert.strictEqual(code, 0, stderr)
+    })
+
     it('stops applying removed decorators', async () => {
         const remove = decorateDriver(recording('removed', seen))
         setDriver(new MemoryDriver())
@@ -68,6 +85,23 @@ describe('driver decoration', () => {
         assert.deepStrictEqual(seen, [])
     })
 })
+
+// The guard runs at module load, so it can only be observed in a process
+// that has not loaded the module yet.
+async function loadInChild(prelude: string) {
+    const module = fileURLToPath(new URL('../lib/driver.js', import.meta.url))
+    try {
+        const { stderr } = await promisify(execFile)(
+            process.execPath,
+            ['--input-type=module', '-e', `${prelude} await import(${JSON.stringify(module)})`],
+            { encoding: 'utf-8' },
+        )
+        return { code: 0, stderr }
+    } catch (e) {
+        const failed = e as { code?: number; stderr?: string }
+        return { code: failed.code ?? 1, stderr: failed.stderr ?? '' }
+    }
+}
 
 function recording(label: string, seen: string[]) {
     return (driver: Driver): Driver => ({
@@ -82,9 +116,10 @@ function delegating(label: string, seen: string[], inner: Connection): Connectio
             seen.push(`${label} add ${table}`)
             return inner.add(table, partition, key, document, options)
         },
-        get: (table, partition, key) => inner.get(table, partition, key),
+        get: (table, partition, key, options) => inner.get(table, partition, key, options),
         getPartitions: table => inner.getPartitions(table),
-        getPartition: (table, partition, range) => inner.getPartition(table, partition, range),
+        getPartition: (table, partition, range, options) =>
+            inner.getPartition(table, partition, range, options),
         update: (table, partition, key, revision, document, options) =>
             inner.update(table, partition, key, revision, document, options),
         delete: (table, partition, key, revision, options) =>

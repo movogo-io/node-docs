@@ -49,9 +49,18 @@ describe('find', () => {
             key: 'h1',
             revision,
             document: { unitId: 'u1' },
+            seq: 0,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
         assert.deepStrictEqual(await holds.findEach(['h1']), [
-            { partition: 's1', key: 'h1', revision, document: { unitId: 'u1' } },
+            {
+                partition: 's1',
+                key: 'h1',
+                revision,
+                document: { unitId: 'u1' },
+                seq: 0,
+                updatedAt: '2026-09-17T12:00:00.000Z',
+            },
         ])
     })
 
@@ -64,7 +73,14 @@ describe('find', () => {
         context.clock = new Date('2026-09-17T12:30Z')
         assert.deepStrictEqual(await holds.find('h1'), undefined)
         assert.deepStrictEqual(await holds.findEach(['h1', 'h2']), [
-            { partition: 's1', key: 'h2', revision, document: { unitId: 'u2' } },
+            {
+                partition: 's1',
+                key: 'h2',
+                revision,
+                document: { unitId: 'u2' },
+                seq: 0,
+                updatedAt: '2026-09-17T12:00:00.000Z',
+            },
         ])
     })
 
@@ -93,6 +109,8 @@ describe('find', () => {
             key: 'profile',
             revision,
             document: { name: 'Ann' },
+            seq: 0,
+            updatedAt: '2026-09-17T12:00:00.000Z',
         })
         assert.deepStrictEqual(await profiles.find('u3'), undefined)
         const found = await profiles.findEach(['u2', 'u3', 'u1'])
@@ -115,13 +133,22 @@ describe('find', () => {
             await tx.Holds.partition('s1').add('h2', { unitId: 'u2' })
             assert.deepStrictEqual(await tx.Holds.partition('s1').find('h2'), undefined)
             assert.deepStrictEqual(await tx.Holds.partition('s1').findEach(['h2', 'h1']), [
-                { partition: 's1', key: 'h1', revision, document: { unitId: 'u1' } },
+                {
+                    partition: 's1',
+                    key: 'h1',
+                    revision,
+                    document: { unitId: 'u1' },
+                    seq: 0,
+                    updatedAt: '2026-09-17T12:00:00.000Z',
+                },
             ])
             assert.deepStrictEqual(await tx.Users.withKey('profile').find('u1'), {
                 partition: 'u1',
                 key: 'profile',
                 revision: profileRevision,
                 document: { name: 'Ann' },
+                seq: 0,
+                updatedAt: '2026-09-17T12:00:00.000Z',
             })
             assert.deepStrictEqual(await tx.Users.withKey('profile').findEach(['u2', 'u1']), [
                 {
@@ -129,6 +156,8 @@ describe('find', () => {
                     key: 'profile',
                     revision: profileRevision,
                     document: { name: 'Ann' },
+                    seq: 0,
+                    updatedAt: '2026-09-17T12:00:00.000Z',
                 },
             ])
         })

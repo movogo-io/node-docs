@@ -6,10 +6,10 @@ import {
     addWithIndexes,
     deleteWithIndexes,
     expandIndexOperations,
-    indexEntriesOf,
-    leftoverEntriesOf,
+    replacedOf,
     updateWithIndexes,
 } from './lib/indexes.js'
+import type { ReadOptions } from './lib/driver.js'
 import { openSession, type Session } from './lib/session.js'
 import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
@@ -79,14 +79,40 @@ type FixedKey<Document> = {
     add: (partition: string, document: Document) => Promise<Revision>
     get: (
         partition: string,
-    ) => Promise<{ partition: string; revision: Revision; document: Document }>
-    getDocument: (partition: string) => Promise<Document>
+        options?: ReadOptions,
+    ) => Promise<{
+        partition: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
+    getDocument: (partition: string, options?: ReadOptions) => Promise<Document>
     find: (
         partition: string,
-    ) => Promise<{ partition: string; revision: Revision; document: Document } | undefined>
+        options?: ReadOptions,
+    ) => Promise<
+        | {
+              partition: string
+              revision: Revision
+              document: Document
+              seq: number
+              updatedAt: string
+          }
+        | undefined
+    >
     findEach: (
         partitions: readonly string[],
-    ) => Promise<{ partition: string; revision: Revision; document: Document }[]>
+        options?: ReadOptions,
+    ) => Promise<
+        {
+            partition: string
+            revision: Revision
+            document: Document
+            seq: number
+            updatedAt: string
+        }[]
+    >
     update: (partition: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: {
         partition: string
@@ -97,7 +123,13 @@ type FixedKey<Document> = {
         partition: string,
         computed: () => Promise<Document> | Document,
         options?: RetryOptions,
-    ) => Promise<{ partition: string; revision: Revision; document: Document }>
+    ) => Promise<{
+        partition: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     addOrUpdate: (
         partition: string,
         document: Document,
@@ -109,6 +141,8 @@ type FixedKey<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     addOrUpdateComputed: (
         partition: string,
@@ -121,6 +155,8 @@ type FixedKey<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     converge: (
         partition: string,
@@ -133,6 +169,8 @@ type FixedKey<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     convergeComputed: (
         partition: string,
@@ -145,36 +183,85 @@ type FixedKey<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     delete: (partition: string, revision: Revision) => Promise<void>
 }
 
 type NamedPartition<Document> = {
     add: (key: string, document: Document) => Promise<Revision>
-    get: (key: string) => Promise<{ key: string; revision: Revision; document: Document }>
-    getDocument: (key: string) => Promise<Document>
+    get: (
+        key: string,
+        options?: ReadOptions,
+    ) => Promise<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
+    getDocument: (key: string, options?: ReadOptions) => Promise<Document>
     find: (
         key: string,
-    ) => Promise<{ key: string; revision: Revision; document: Document } | undefined>
+        options?: ReadOptions,
+    ) => Promise<
+        | {
+              key: string
+              revision: Revision
+              document: Document
+              seq: number
+              updatedAt: string
+          }
+        | undefined
+    >
     findEach: (
         keys: readonly string[],
-    ) => Promise<{ key: string; revision: Revision; document: Document }[]>
-    getAll: () => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+        options?: ReadOptions,
+    ) => Promise<
+        { key: string; revision: Revision; document: Document; seq: number; updatedAt: string }[]
+    >
+    getAll: (options?: ReadOptions) => AsyncIterable<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     getRange: (
         range: KeyRange,
-    ) => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+        options?: ReadOptions,
+    ) => AsyncIterable<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     update: (key: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: { key: string; revision: Revision; document: Document }) => Promise<Revision>
     getOrAdd: (
         key: string,
         document: Document,
         options?: RetryOptions,
-    ) => Promise<{ key: string; revision: Revision; document: Document }>
+    ) => Promise<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     getOrAddComputed: (
         key: string,
         computed: () => Promise<Document> | Document,
         options?: RetryOptions,
-    ) => Promise<{ key: string; revision: Revision; document: Document }>
+    ) => Promise<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     addOrUpdate: (
         key: string,
         document: Document,
@@ -186,6 +273,8 @@ type NamedPartition<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     addOrUpdateComputed: (
         key: string,
@@ -198,6 +287,8 @@ type NamedPartition<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     converge: (
         key: string,
@@ -210,6 +301,8 @@ type NamedPartition<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     convergeComputed: (
         key: string,
@@ -222,6 +315,8 @@ type NamedPartition<Document> = {
         key: string
         revision: Revision
         document: Document
+        seq: number
+        updatedAt: string
     }>
     delete: (key: string, revision: Revision) => Promise<void>
 }
@@ -292,48 +387,53 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
         withKey: (key: string) => ({
             async add(partition: string, document: unknown) {
                 const c = await session.connection
-                return await addWithIndexes(
+                return (
+                    await addWithIndexes(c, table, partition, key, document, session.nowSeconds())
+                ).revision
+            },
+            async get(partition: string, options?: ReadOptions) {
+                const c = await session.connection
+                return await getUnexpired(c, table, partition, key, session.nowSeconds(), options)
+            },
+            async getDocument(partition: string, options?: ReadOptions) {
+                const c = await session.connection
+                const r = await getUnexpired(
                     c,
                     table,
                     partition,
                     key,
-                    document,
                     session.nowSeconds(),
+                    options,
                 )
-            },
-            async get(partition: string) {
-                const c = await session.connection
-                return await getUnexpired(c, table, partition, key, session.nowSeconds())
-            },
-            async getDocument(partition: string) {
-                const c = await session.connection
-                const r = await getUnexpired(c, table, partition, key, session.nowSeconds())
                 return r.document
             },
-            async find(partition: string) {
+            async find(partition: string, options?: ReadOptions) {
                 const c = await session.connection
-                return await findUnexpired(c, table, partition, key, session.nowSeconds())
+                return await findUnexpired(c, table, partition, key, session.nowSeconds(), options)
             },
-            async findEach(partitions: readonly string[]) {
+            async findEach(partitions: readonly string[], options?: ReadOptions) {
                 const c = await session.connection
                 return await findEachUnexpired(
                     c,
                     table,
                     partitions.map(partition => ({ partition, key })),
                     session.nowSeconds(),
+                    options,
                 )
             },
             async update(partition: string, revision: Revision, document: StoredDocument) {
                 const c = await session.connection
-                return await updateWithIndexes(
-                    c,
-                    table,
-                    partition,
-                    key,
-                    revision,
-                    document,
-                    session.nowSeconds(),
-                )
+                return (
+                    await updateWithIndexes(
+                        c,
+                        table,
+                        partition,
+                        key,
+                        revision,
+                        document,
+                        session.nowSeconds(),
+                    )
+                ).revision
             },
             async updateRow(row: {
                 partition: string
@@ -341,15 +441,17 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 document: StoredDocument
             }) {
                 const c = await session.connection
-                return await updateWithIndexes(
-                    c,
-                    table,
-                    row.partition,
-                    key,
-                    row.revision,
-                    row.document,
-                    session.nowSeconds(),
-                )
+                return (
+                    await updateWithIndexes(
+                        c,
+                        table,
+                        row.partition,
+                        key,
+                        row.revision,
+                        row.document,
+                        session.nowSeconds(),
+                    )
+                ).revision
             },
             getOrAdd: async (partition: string, document: unknown, options?: RetryOptions) =>
                 await getOrAdd(session, table, partition, key, document, options),
@@ -435,70 +537,94 @@ class Partition {
 
     async add(key: string, document: StoredDocument) {
         const c = await this.#session.connection
-        return await addWithIndexes(
+        return (
+            await addWithIndexes(
+                c,
+                this.#table,
+                this.#partition,
+                key,
+                document,
+                this.#session.nowSeconds(),
+            )
+        ).revision
+    }
+    async get(key: string, options?: ReadOptions) {
+        const c = await this.#session.connection
+        return await getUnexpired(
             c,
             this.#table,
             this.#partition,
             key,
-            document,
             this.#session.nowSeconds(),
+            options,
         )
     }
-    async get(key: string) {
-        const c = await this.#session.connection
-        return await getUnexpired(c, this.#table, this.#partition, key, this.#session.nowSeconds())
-    }
-    async getDocument(key: string) {
-        const r = await this.get(key)
+    async getDocument(key: string, options?: ReadOptions) {
+        const r = await this.get(key, options)
         return r.document
     }
-    async find(key: string) {
+    async find(key: string, options?: ReadOptions) {
         const c = await this.#session.connection
-        return await findUnexpired(c, this.#table, this.#partition, key, this.#session.nowSeconds())
+        return await findUnexpired(
+            c,
+            this.#table,
+            this.#partition,
+            key,
+            this.#session.nowSeconds(),
+            options,
+        )
     }
-    async findEach(keys: readonly string[]) {
+    async findEach(keys: readonly string[], options?: ReadOptions) {
         const c = await this.#session.connection
         return await findEachUnexpired(
             c,
             this.#table,
             keys.map(key => ({ partition: this.#partition, key })),
             this.#session.nowSeconds(),
+            options,
         )
     }
-    async *getAll() {
-        const c = await this.#session.connection
-        yield* unexpired(c.getPartition(this.#table, this.#partition), this.#session.nowSeconds())
-    }
-    async *getRange(range: KeyRange) {
+    async *getAll(options?: ReadOptions) {
         const c = await this.#session.connection
         yield* unexpired(
-            c.getPartition(this.#table, this.#partition, range),
+            c.getPartition(this.#table, this.#partition, undefined, options),
+            this.#session.nowSeconds(),
+        )
+    }
+    async *getRange(range: KeyRange, options?: ReadOptions) {
+        const c = await this.#session.connection
+        yield* unexpired(
+            c.getPartition(this.#table, this.#partition, range, options),
             this.#session.nowSeconds(),
         )
     }
     async update(key: string, revision: Revision, document: StoredDocument) {
         const c = await this.#session.connection
-        return await updateWithIndexes(
-            c,
-            this.#table,
-            this.#partition,
-            key,
-            revision,
-            document,
-            this.#session.nowSeconds(),
-        )
+        return (
+            await updateWithIndexes(
+                c,
+                this.#table,
+                this.#partition,
+                key,
+                revision,
+                document,
+                this.#session.nowSeconds(),
+            )
+        ).revision
     }
     async updateRow(row: { key: string; revision: Revision; document: StoredDocument }) {
         const c = await this.#session.connection
-        return await updateWithIndexes(
-            c,
-            this.#table,
-            this.#partition,
-            row.key,
-            row.revision,
-            row.document,
-            this.#session.nowSeconds(),
-        )
+        return (
+            await updateWithIndexes(
+                c,
+                this.#table,
+                this.#partition,
+                row.key,
+                row.revision,
+                row.document,
+                this.#session.nowSeconds(),
+            )
+        ).revision
     }
     async getOrAdd(key: string, document: unknown, options?: RetryOptions) {
         return await getOrAdd(this.#session, this.#table, this.#partition, key, document, options)
@@ -629,14 +755,40 @@ type TransactionFixedKey<Document> = {
     add: (partition: string, document: Document) => Promise<Revision>
     get: (
         partition: string,
-    ) => Promise<{ partition: string; revision: Revision; document: Document }>
-    getDocument: (partition: string) => Promise<Document>
+        options?: ReadOptions,
+    ) => Promise<{
+        partition: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
+    getDocument: (partition: string, options?: ReadOptions) => Promise<Document>
     find: (
         partition: string,
-    ) => Promise<{ partition: string; revision: Revision; document: Document } | undefined>
+        options?: ReadOptions,
+    ) => Promise<
+        | {
+              partition: string
+              revision: Revision
+              document: Document
+              seq: number
+              updatedAt: string
+          }
+        | undefined
+    >
     findEach: (
         partitions: readonly string[],
-    ) => Promise<{ partition: string; revision: Revision; document: Document }[]>
+        options?: ReadOptions,
+    ) => Promise<
+        {
+            partition: string
+            revision: Revision
+            document: Document
+            seq: number
+            updatedAt: string
+        }[]
+    >
     update: (partition: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: {
         partition: string
@@ -649,18 +801,53 @@ type TransactionFixedKey<Document> = {
 
 type TransactionNamedPartition<Document> = {
     add: (key: string, document: Document) => Promise<Revision>
-    get: (key: string) => Promise<{ key: string; revision: Revision; document: Document }>
-    getDocument: (key: string) => Promise<Document>
+    get: (
+        key: string,
+        options?: ReadOptions,
+    ) => Promise<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
+    getDocument: (key: string, options?: ReadOptions) => Promise<Document>
     find: (
         key: string,
-    ) => Promise<{ key: string; revision: Revision; document: Document } | undefined>
+        options?: ReadOptions,
+    ) => Promise<
+        | {
+              key: string
+              revision: Revision
+              document: Document
+              seq: number
+              updatedAt: string
+          }
+        | undefined
+    >
     findEach: (
         keys: readonly string[],
-    ) => Promise<{ key: string; revision: Revision; document: Document }[]>
-    getAll: () => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+        options?: ReadOptions,
+    ) => Promise<
+        { key: string; revision: Revision; document: Document; seq: number; updatedAt: string }[]
+    >
+    getAll: (options?: ReadOptions) => AsyncIterable<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     getRange: (
         range: KeyRange,
-    ) => AsyncIterable<{ key: string; revision: Revision; document: Document }>
+        options?: ReadOptions,
+    ) => AsyncIterable<{
+        key: string
+        revision: Revision
+        document: Document
+        seq: number
+        updatedAt: string
+    }>
     update: (key: string, revision: Revision, document: Document) => Promise<Revision>
     updateRow: (row: { key: string; revision: Revision; document: Document }) => Promise<Revision>
     check: (key: string, revision: Revision) => Promise<void>
@@ -752,23 +939,23 @@ class TransactionPartition {
         this.#partition = partition
     }
 
-    get(key: string) {
-        return this.#reads.get(key)
+    get(key: string, options?: ReadOptions) {
+        return this.#reads.get(key, options)
     }
-    getDocument(key: string) {
-        return this.#reads.getDocument(key)
+    getDocument(key: string, options?: ReadOptions) {
+        return this.#reads.getDocument(key, options)
     }
-    find(key: string) {
-        return this.#reads.find(key)
+    find(key: string, options?: ReadOptions) {
+        return this.#reads.find(key, options)
     }
-    findEach(keys: readonly string[]) {
-        return this.#reads.findEach(keys)
+    findEach(keys: readonly string[], options?: ReadOptions) {
+        return this.#reads.findEach(keys, options)
     }
-    getAll() {
-        return this.#reads.getAll()
+    getAll(options?: ReadOptions) {
+        return this.#reads.getAll(options)
     }
-    getRange(range: KeyRange) {
-        return this.#reads.getRange(range)
+    getRange(range: KeyRange, options?: ReadOptions) {
+        return this.#reads.getRange(range, options)
     }
     add(key: string, document: StoredDocument) {
         return this.#buffer.add(this.#table, this.#partition, key, document)
@@ -806,25 +993,40 @@ class TransactionFixedKeySet {
         this.#key = key
     }
 
-    async get(partition: string) {
+    async get(partition: string, options?: ReadOptions) {
         const c = await this.#session.connection
-        return await getUnexpired(c, this.#table, partition, this.#key, this.#session.nowSeconds())
+        return await getUnexpired(
+            c,
+            this.#table,
+            partition,
+            this.#key,
+            this.#session.nowSeconds(),
+            options,
+        )
     }
-    async getDocument(partition: string) {
-        const r = await this.get(partition)
+    async getDocument(partition: string, options?: ReadOptions) {
+        const r = await this.get(partition, options)
         return r.document
     }
-    async find(partition: string) {
+    async find(partition: string, options?: ReadOptions) {
         const c = await this.#session.connection
-        return await findUnexpired(c, this.#table, partition, this.#key, this.#session.nowSeconds())
+        return await findUnexpired(
+            c,
+            this.#table,
+            partition,
+            this.#key,
+            this.#session.nowSeconds(),
+            options,
+        )
     }
-    async findEach(partitions: readonly string[]) {
+    async findEach(partitions: readonly string[], options?: ReadOptions) {
         const c = await this.#session.connection
         return await findEachUnexpired(
             c,
             this.#table,
             partitions.map(partition => ({ partition, key: this.#key })),
             this.#session.nowSeconds(),
+            options,
         )
     }
     add(partition: string, document: StoredDocument) {
@@ -850,8 +1052,25 @@ class TransactionFixedKeySet {
     }
 }
 
-export type RetryOptions = { retries?: number; delay?: number; signal?: AbortSignal }
-type Row = { partition: string; key: string; revision: unknown; document: unknown }
+// `consistent` reaches the read a helper makes before it writes; see ReadOptions.
+export type RetryOptions = {
+    retries?: number
+    delay?: number
+    signal?: AbortSignal
+    consistent?: boolean
+}
+
+function readOptionsOf(options: RetryOptions | undefined): ReadOptions | undefined {
+    return options?.consistent === undefined ? undefined : { consistent: options.consistent }
+}
+type Row = {
+    partition: string
+    key: string
+    revision: unknown
+    document: unknown
+    seq: number
+    updatedAt: string
+}
 
 async function getOrAdd(
     session: Session,
@@ -864,13 +1083,20 @@ async function getOrAdd(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (live) {
             return live
         }
-        const leftover = leftoverEntriesOf(table, partition, key, expired)
-        const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
-        return { partition, key, revision, document }
+        const replaced = replacedOf(table, partition, key, expired)
+        const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+        return { partition, key, document, ...written }
     }, options)
 }
 
@@ -885,14 +1111,21 @@ async function getOrAddComputed<T>(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (live) {
             return live
         }
         const document = await callback()
-        const leftover = leftoverEntriesOf(table, partition, key, expired)
-        const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
-        return { partition, key, revision, document }
+        const replaced = replacedOf(table, partition, key, expired)
+        const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+        return { partition, key, document, ...written }
     }, options)
 }
 
@@ -908,15 +1141,22 @@ async function addOrUpdate<T>(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (!live) {
-            const leftover = leftoverEntriesOf(table, partition, key, expired)
-            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
-            return { action: 'add', partition, key, revision, document }
+            const replaced = replacedOf(table, partition, key, expired)
+            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            return { action: 'add', partition, key, document, ...written }
         }
-        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
-        const revision = await updateWithIndexes(
+        const written = await updateWithIndexes(
             c,
             table,
             partition,
@@ -924,9 +1164,9 @@ async function addOrUpdate<T>(
             live.revision,
             updated,
             now,
-            oldEntries,
+            replaced,
         )
-        return { action: 'update', partition, key, revision, document: updated }
+        return { action: 'update', partition, key, document: updated, ...written }
     }, options)
 }
 
@@ -942,16 +1182,23 @@ async function addOrUpdateComputed<T>(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (!live) {
             const document = await computed()
-            const leftover = leftoverEntriesOf(table, partition, key, expired)
-            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
-            return { action: 'add', partition, key, revision, document }
+            const replaced = replacedOf(table, partition, key, expired)
+            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            return { action: 'add', partition, key, document, ...written }
         }
-        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
-        const revision = await updateWithIndexes(
+        const written = await updateWithIndexes(
             c,
             table,
             partition,
@@ -959,9 +1206,9 @@ async function addOrUpdateComputed<T>(
             live.revision,
             updated,
             now,
-            oldEntries,
+            replaced,
         )
-        return { action: 'update', partition, key, revision, document: updated }
+        return { action: 'update', partition, key, document: updated, ...written }
     }, options)
 }
 
@@ -979,19 +1226,26 @@ async function converge<T>(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (!live) {
-            const leftover = leftoverEntriesOf(table, partition, key, expired)
-            const revision = await addWithIndexes(c, table, partition, key, initial, now, leftover)
-            return { partition, key, revision, document: initial }
+            const replaced = replacedOf(table, partition, key, expired)
+            const written = await addWithIndexes(c, table, partition, key, initial, now, replaced)
+            return { partition, key, document: initial, ...written }
         }
         if (target(live.document as T)) {
             return live
         }
-        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
         assert.ok(target(updated), 'Updated document does not meet target.')
-        const revision = await updateWithIndexes(
+        const written = await updateWithIndexes(
             c,
             table,
             partition,
@@ -999,9 +1253,9 @@ async function converge<T>(
             live.revision,
             updated,
             now,
-            oldEntries,
+            replaced,
         )
-        return { partition, key, revision, document: updated }
+        return { partition, key, document: updated, ...written }
     }, options)
 }
 
@@ -1018,21 +1272,28 @@ async function convergeComputed<T>(
     return await retryConflict(async () => {
         const c = await session.connection
         const now = session.nowSeconds()
-        const { live, expired } = await getRow(c, table, partition, key, now)
+        const { live, expired } = await getRow(
+            c,
+            table,
+            partition,
+            key,
+            now,
+            readOptionsOf(options),
+        )
         if (!live) {
             const document = await initial()
             assert.ok(target(document), 'Initial document does not meet target.')
-            const leftover = leftoverEntriesOf(table, partition, key, expired)
-            const revision = await addWithIndexes(c, table, partition, key, document, now, leftover)
-            return { partition, key, revision, document }
+            const replaced = replacedOf(table, partition, key, expired)
+            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            return { partition, key, document, ...written }
         }
         if (target(live.document as T)) {
             return live
         }
-        const oldEntries = indexEntriesOf(table, partition, key, live.document)
+        const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
         assert.ok(target(updated), 'Updated document does not meet target.')
-        const revision = await updateWithIndexes(
+        const written = await updateWithIndexes(
             c,
             table,
             partition,
@@ -1040,9 +1301,9 @@ async function convergeComputed<T>(
             live.revision,
             updated,
             now,
-            oldEntries,
+            replaced,
         )
-        return { partition, key, revision, document: updated }
+        return { partition, key, document: updated, ...written }
     }, options)
 }
 
@@ -1066,3 +1327,4 @@ export async function retryConflict<T>(fn: () => Promise<T>, options?: RetryOpti
 }
 
 export { isConflict, isNotFound } from './lib/errors.js'
+export type { ReadOptions } from './lib/driver.js'

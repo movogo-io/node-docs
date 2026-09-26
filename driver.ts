@@ -4,6 +4,8 @@ export {
     setDriver,
     type Connection,
     type Driver,
+    type ReadOptions,
     type TransactionItem,
+    type Written,
 } from './lib/driver.js'
 export { maxTransactionItems } from './lib/transaction.js'

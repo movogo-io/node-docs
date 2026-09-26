@@ -1,3 +1,4 @@
+import type { ReadOptions } from './lib/driver.js'
 import { registerExpiry, unexpired } from './lib/expiry.js'
 import {
     assertClean,
@@ -83,9 +84,9 @@ export type IndexRow<Document> = {
 }
 
 type Index<Document> = {
-    first: (key: string) => Promise<IndexRow<Document> | undefined>
-    firstDocument: (key: string) => Promise<Document | undefined>
-    getRange: (range: KeyRange) => AsyncIterable<IndexRow<Document>>
+    first: (key: string, options?: ReadOptions) => Promise<IndexRow<Document> | undefined>
+    firstDocument: (key: string, options?: ReadOptions) => Promise<Document | undefined>
+    getRange: (range: KeyRange, options?: ReadOptions) => AsyncIterable<IndexRow<Document>>
 }
 
 export function docs<Schema = GenericSchema>(): SchemaHandle<Schema> {
@@ -157,9 +158,9 @@ class IndexReader {
         this.#partition = partition
     }
 
-    async first(key: string) {
+    async first(key: string, options?: ReadOptions) {
         assertClean(key, 'index key')
-        const rows = this.#rows({ withPrefix: key + indexKeyDelimiter })
+        const rows = this.#rows({ withPrefix: key + indexKeyDelimiter }, options)
         try {
             const first = await rows.next()
             return first.done ? undefined : first.value
@@ -168,23 +169,23 @@ class IndexReader {
         }
     }
 
-    async firstDocument(key: string) {
-        return (await this.first(key))?.document
+    async firstDocument(key: string, options?: ReadOptions) {
+        return (await this.first(key, options))?.document
     }
 
-    async *getRange(range: KeyRange) {
+    async *getRange(range: KeyRange, options?: ReadOptions) {
         validateRange(range)
         const matches = matchRange(range)
-        for await (const row of this.#rows(range)) {
+        for await (const row of this.#rows(range, options)) {
             if (matches(row.key)) {
                 yield row
             }
         }
     }
 
-    async *#rows(range: KeyRange) {
+    async *#rows(range: KeyRange, options?: ReadOptions) {
         const c = await this.#session.connection
-        const rows = c.getPartition(indexTable(this.#definition), this.#partition, range)
+        const rows = c.getPartition(indexTable(this.#definition), this.#partition, range, options)
         for await (const row of unexpired(rows, this.#session.nowSeconds())) {
             yield decode(row)
         }

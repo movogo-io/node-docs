@@ -190,6 +190,33 @@ describe('indexes', () => {
         assert.strictEqual(renamed?.document.name, 'renamed')
     })
 
+    it('should count writes on the document like a table without indexes', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals.partition('s1')
+        const added = await rentals.add('r1', aRental({ unitId: 'u1' }))
+        assert.strictEqual((await rentals.get('r1')).seq, 0)
+
+        const updated = await rentals.update('r1', added, aRental({ unitId: 'u2' }))
+        assert.strictEqual((await rentals.get('r1')).seq, 1)
+
+        await withTransaction<Schema>(context, async tx => {
+            await tx.IndexedRentals.partition('s1').update('r1', updated, aRental({ unitId: 'u3' }))
+        })
+        assert.strictEqual((await rentals.get('r1')).seq, 2)
+
+        const converged = await rentals.addOrUpdate('r1', aRental(), existing => {
+            existing.unitId = 'u4'
+        })
+        assert.strictEqual(converged.seq, 3)
+        assert.deepStrictEqual(converged, { action: 'update', ...(await rentals.get('r1')) })
+        assert.deepStrictEqual(await byUnit(context).partition('u4').first('r1'), {
+            key: 'r1',
+            revision: converged.revision,
+            document: aRental({ unitId: 'u4' }),
+            source: { partition: 's1', key: 'r1' },
+        })
+    })
+
     it('should maintain indexes inside transactions', async () => {
         await using context = new TestContext()
         const rentals = schema.tables(context).IndexedRentals
