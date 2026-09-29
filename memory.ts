@@ -3,6 +3,7 @@ import { setTimeout } from 'node:timers/promises'
 import type { ReadOptions, TransactionItem } from './lib/driver.js'
 import { conflict, notFound } from './lib/errors.js'
 import { isoOf } from './lib/expiry.js'
+import { maxTransactionBytes, maxTransactionItems } from './lib/transaction.js'
 import type { KeyRange } from './schema.js'
 
 const documentsEntry = Symbol()
@@ -269,6 +270,7 @@ class MemoryDocuments {
 
     transact(items: TransactionItem[], options: { now: number }) {
         throwIfAnyDocumentRepeats(items)
+        throwIfOverLimits(items)
         const updatedAt = isoOf(options.now)
         const applies = items.map(item => {
             const p = this.#tables.get(item.table).get(item.partition)
@@ -620,6 +622,41 @@ function throwIfAnyDocumentRepeats(items: TransactionItem[]) {
         }
         touched.add(id)
     }
+}
+
+// DynamoDB refuses a transaction of more than 100 items or 4 MB, on every
+// retry alike. The items arrive here after index maintenance and auditing have
+// added theirs, so this is where a test sees the transaction production sends.
+function throwIfOverLimits(items: TransactionItem[]) {
+    if (maxTransactionItems < items.length) {
+        throw new Error(
+            `Transaction contains ${String(items.length)} operations on ${tablesOf(items)}; at most ${String(maxTransactionItems)} are allowed.`,
+        )
+    }
+    const bytes = items.reduce((sum, item) => sum + itemBytes(item), 0)
+    if (maxTransactionBytes < bytes) {
+        throw new Error(
+            `Transaction of ${String(items.length)} operations on ${tablesOf(items)} is about ${String(bytes)} bytes; at most ${String(maxTransactionBytes)} are allowed.`,
+        )
+    }
+}
+
+// An estimate of the item DynamoDB stores, erring high: the document as the
+// JSON string the DynamoDB driver writes, the key, and an allowance for the
+// revision, counters and timestamps beside them. An operation without a
+// document sends only its key.
+function itemBytes(item: TransactionItem) {
+    const keyBytes = Buffer.byteLength(item.partition) + Buffer.byteLength(item.key)
+    if ('document' in item) {
+        return keyBytes + Buffer.byteLength(JSON.stringify(item.document)) + envelopeBytes
+    }
+    return keyBytes
+}
+
+const envelopeBytes = 256
+
+function tablesOf(items: TransactionItem[]) {
+    return [...new Set(items.map(item => `'${item.table}'`))].join(', ')
 }
 
 async function delayed() {

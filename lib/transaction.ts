@@ -5,6 +5,8 @@ import { expiryOf } from './expiry.js'
 
 export const maxTransactionItems = 100
 
+export const maxTransactionBytes = 4 * 1024 * 1024
+
 export class TransactionBuffer {
     readonly #items: TransactionItem[] = []
     readonly #touched = new Set<string>()

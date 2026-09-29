@@ -8,4 +8,4 @@ export {
     type TransactionItem,
     type Written,
 } from './lib/driver.js'
-export { maxTransactionItems } from './lib/transaction.js'
+export { maxTransactionBytes, maxTransactionItems } from './lib/transaction.js'
