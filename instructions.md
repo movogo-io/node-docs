@@ -227,7 +227,8 @@ The `tx` argument mirrors the `tables` surface with these rules:
 - **Writes are buffered.** `add`, `update`, `updateRow`, `check`, and `delete` do not touch storage when called; they are queued and applied atomically when the callback resolves. Returned revisions are final and usable after the commit.
 - **Reads return committed state.** `get`, `getDocument`, `find`, `findEach`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction. They take the same trailing `{ consistent: true }` as outside a transaction, for a revision check the transaction's own conditions must not mistake for a lost race.
 - **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
-- **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried.
+- **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried. Index maintenance and audit entries count toward the 100.
+- **At most 4 MB in all.** DynamoDB refuses a larger transaction, and refuses it again on every retry, so work queued behind it never finishes. Every index entry and every audit entry is a copy of the document, so a batch of large documents reaches 4 MB long before 100 operations. The memory drivers refuse both limits, so a test sees what production would; a service that packs writes into batches fills each one up to both, with the exported `maxTransactionItems` and `maxTransactionBytes` from `@movogo-io/docs/driver`, instead of a fixed count.
 - **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
 - The retry helpers (`getOrAdd`, `addOrUpdate`, `converge`) are not available inside a transaction; the whole-transaction retry replaces them.
 - If the callback throws, nothing is written.
@@ -267,7 +268,7 @@ export function rentals(context: object, supplierId: string) {
 }
 ```
 
-Both extractors receive `{ partition, key, document }` of the row being written and return a string, or `undefined` to omit the row from that index (a **sparse** index — ideal for due/deadline sweeps). The value returned by `schema.index` is the typed, **read-only** accessor:
+Both extractors receive `{ partition, key, document }` of the row being written and return a string, or `undefined` to omit the row from that index (a **sparse** index — ideal for due/deadline sweeps). The value returned by `schema.index` is the typed accessor, for reads and for `reindex`:
 
 ```ts
 // Open-string index partitions:
@@ -280,6 +281,22 @@ for await (const r of rentalsDue(context).pending.getRange({ before: today })) {
 }
 ```
 
+An extractor may also return an array: the row then gets an entry for every partition and key pair, so a document that belongs to several things is found under each of them, and `[]` omits it like `undefined`:
+
+```ts
+// Find equipment by the groups it belongs to.
+export const equipmentByGroup = schema.index(
+    "Equipment",
+    "byGroup",
+    (r) => r.document.groupIds.map((groupId) => JSON.stringify([r.partition, groupId])), // one partition per group
+    (r) => r.key,
+);
+
+for await (const r of equipmentByGroup(context).partition(JSON.stringify([supplierId, groupId])).getRange({ after })) {
+    // one page of the group's equipment
+}
+```
+
 Rules and properties:
 
 - **Declare before the first write.** Writes consult the registered definitions, so `schema.index` calls must run before the table is written to — automatic when declarations live in `./lib/schema.ts` beside the accessor helpers.
@@ -287,9 +304,11 @@ Rules and properties:
 - **Index rows carry the document and its revision, but not `seq` or `updatedAt`.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`. An entry keeps its own write counter, which is not the source document's, so neither is exposed; read the document itself for its `seq`.
 - **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table. Both, and `firstDocument`, take the trailing `{ consistent: true }` of a table read.
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
+- **A multi-valued membership goes in the partition, the member's key in the key.** A range is either `withPrefix` or `after`/`before`, never both, so values encoded in the key cannot be paged with `after` within one value; a value in the partition pages with a plain `after`. Repeated values give one entry. A range spanning several values of one row returns that row once per value: count documents by `source`, not by rows.
 - **Extractors must handle every document shape ever stored.** A write computes the entries of the document it replaces, including an expired one under the same key, so an extractor that throws on a legacy shape makes `add`, `update`, and `delete` of that key fail.
-- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. That read is eventual; a revision other than the caller's is read again consistently before the write is called a conflict, so a row this process updated milliseconds earlier does not fail its own next update on a stale replica. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
-- **Changing an index definition needs a backfill.** Entries are only rewritten when their document is written, and cleanup computes old entries with the *current* extractors — after changing extractors, sweep the table and rewrite each row (and clear the index's old shadow table, named `<Table>.<indexName>`).
+- **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. Every write puts every entry again, not only the ones that changed, so a document with ten entries writes eleven copies of itself on a change to any field, twelve on an audited table. A single write is refused before it reaches the driver when its entries take it past 100 operations, and the 4 MB and 100-operation limits of a transaction (see Transactions) arrive sooner the more entries a document has. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. That read is eventual; a revision other than the caller's is read again consistently before the write is called a conflict, so a row this process updated milliseconds earlier does not fail its own next update on a stale replica. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
+- **Backfill with `reindex`, not by rewriting.** Entries are only written when their document is written, so rows written before an index was declared, or before its extractor changed, are missing from it. `index(context).reindex(sourcePartition, sourceKey)` writes one row's entries in that index and leaves the row alone: the entries carry the row's revision and stored expiry, a write landing in between makes it retry, and an absent or expired row writes nothing. A rewrite would do the same at the price of a new revision (stale `If-Match` for every client), an audit entry and a `document.changed` per row. Sweep the table with `getAll` and call `reindex` per row; it is idempotent, so the sweep can be re-run.
+- **A changed extractor needs a new index name.** Cleanup computes old entries with the *current* extractors, and so does `reindex`, so entries an old extractor wrote are keyed by values nothing computes any more and are never cleared. Give the changed index a new name, backfill it, and drop the old shadow table, named `<Table>.<indexName>`.
 
 ## Expiry
 
@@ -335,7 +354,7 @@ import { decorateDriver, type Driver } from '@movogo-io/docs/driver';
 decorateDriver((driver: Driver) => wrapped(driver));
 ```
 
-Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` budget. `getMany` is optional on a connection: a decorator that lists the methods it forwards and leaves it out turns every `findEach` beneath it into single reads, 16 at a time, which is correct but forfeits the driver's batch read — forward it when the wrapped connection has one.
+Decorators are applied lazily whenever the driver is used, regardless of the order of `decorateDriver` and `setDriver` calls, and survive driver replacement. The last-registered decorator becomes the outermost wrapper. `decorateDriver` returns a function that removes the decorator again. This is a plumbing API for infrastructure packages — services should not need it. Decorators that append operations to `transact` calls can preflight against the exported `maxTransactionItems` and `maxTransactionBytes` budgets. `getMany` is optional on a connection: a decorator that lists the methods it forwards and leaves it out turns every `findEach` beneath it into single reads, 16 at a time, which is correct but forfeits the driver's batch read — forward it when the wrapped connection has one.
 
 A decorator must forward the trailing read options of `get`, `getMany` and `getPartition` to the wrapped connection; one that drops them makes every read beneath it silently lose the consistency it asked for.
 
@@ -343,4 +362,4 @@ The driver, its decorators and the index and expiry registries are module state,
 
 ## Test drivers
 
-`@movogo-io/docs/test/memory` ships in-memory drivers for tests, all implementing the connection contract: `MemoryDriver` keeps one store per context, `PersistentMemoryDriver` one store per driver instance with a closable connection per `connect()`, as DynamoDB connections are, and `DelayedPersistentMemoryDriver` the same with a random sub-millisecond delay on every operation, so interleavings a synchronous store would never produce do show up. `LaggingPersistentMemoryDriver` models eventual consistency deterministically: the first read of a row without `{ consistent: true }` after a write to it sees the row as it was before that write (present, absent or expired), every later read and every consistent read sees the write. Run the flows that read back what they just wrote under it, so a read that needed `{ consistent: true }` fails in the test run rather than once a second on DynamoDB. `@movogo-io/docs/test/mock` is the mocha root hook that installs a fresh `PersistentMemoryDriver` before each test.
+`@movogo-io/docs/test/memory` ships in-memory drivers for tests, all implementing the connection contract and refusing a transaction DynamoDB would refuse (more than 100 operations, two on one document, or more than 4 MB): `MemoryDriver` keeps one store per context, `PersistentMemoryDriver` one store per driver instance with a closable connection per `connect()`, as DynamoDB connections are, and `DelayedPersistentMemoryDriver` the same with a random sub-millisecond delay on every operation, so interleavings a synchronous store would never produce do show up. `LaggingPersistentMemoryDriver` models eventual consistency deterministically: the first read of a row without `{ consistent: true }` after a write to it sees the row as it was before that write (present, absent or expired), every later read and every consistent read sees the write. Run the flows that read back what they just wrote under it, so a read that needed `{ consistent: true }` fails in the test run rather than once a second on DynamoDB. `@movogo-io/docs/test/mock` is the mocha root hook that installs a fresh `PersistentMemoryDriver` before each test.
