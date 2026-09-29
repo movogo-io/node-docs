@@ -169,7 +169,7 @@ export async function* unexpired<Row extends { expiresAt?: number }>(
     }
 }
 
-function isExpired(expiresAt: number | undefined, nowSeconds: number) {
+export function isExpired(expiresAt: number | undefined, nowSeconds: number) {
     return expiresAt !== undefined && expiresAt <= nowSeconds
 }
 

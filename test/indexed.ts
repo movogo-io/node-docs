@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { setDriver } from '../driver.js'
+import { decorateDriver, setDriver, type Driver, type TransactionItem } from '../driver.js'
 import { docs } from '../indexed.js'
 import { DelayedPersistentMemoryDriver } from '../memory.js'
 import { isConflict, withTransaction } from '../partitioned.js'
@@ -548,6 +548,159 @@ describe('multi-entry indexes', () => {
     })
 })
 
+const reindexedSchema = docs<{
+    ReindexedLate: {
+        [supplierId: string]: {
+            [equipmentId: string]: { groupIds: string[] }
+        }
+    }
+    ReindexedLateExpiry: {
+        [supplierId: string]: {
+            [equipmentId: string]: { groupIds: string[]; expiresAt: string }
+        }
+    }
+    ReindexedExpiring: {
+        [supplierId: string]: {
+            [equipmentId: string]: { groupIds: string[]; expiresAt: string }
+        }
+    }
+}>()
+reindexedSchema.expiry('ReindexedExpiring', document => new Date(document.expiresAt))
+const byExpiringGroup = reindexedSchema.index(
+    'ReindexedExpiring',
+    'byGroup',
+    r => r.document.groupIds,
+    r => r.key,
+)
+
+describe('reindex', () => {
+    beforeEach(() => {
+        setDriver(new DelayedPersistentMemoryDriver())
+    })
+
+    it('should write nothing for an absent or expired row', async () => {
+        await using context = new TestContext()
+        await reindexedSchema
+            .tables(context)
+            .ReindexedExpiring.partition('s1')
+            .add('e1', {
+                groupIds: ['g1'],
+                expiresAt: '2000-01-01T00:00:00Z',
+            })
+        const transactions: TransactionItem[][] = []
+        const remove = decorateDriver(
+            interceptingTransactions(items => {
+                transactions.push(items)
+                return Promise.resolve()
+            }),
+        )
+        try {
+            await byExpiringGroup(context).reindex('s1', 'e1')
+            await byExpiringGroup(context).reindex('s1', 'e2')
+        } finally {
+            remove()
+        }
+
+        assert.deepStrictEqual(transactions, [])
+    })
+
+    it('should write the entries of a row written before its index', async () => {
+        await using context = new TestContext()
+        const late = reindexedSchema.tables(context).ReindexedLate.partition('s1')
+        await late.add('e1', { groupIds: ['g1', 'g2'] })
+        const written = await late.get('e1')
+        const byLateGroup = reindexedSchema.index(
+            'ReindexedLate',
+            'byGroup',
+            r => r.document.groupIds,
+            r => r.key,
+        )
+
+        await byLateGroup(context).reindex('s1', 'e1')
+
+        assert.deepStrictEqual(await byLateGroup(context).partition('g2').first('e1'), {
+            key: 'e1',
+            revision: written.revision,
+            document: { groupIds: ['g1', 'g2'] },
+            source: { partition: 's1', key: 'e1' },
+        })
+        assert.deepStrictEqual(await late.get('e1'), written)
+    })
+
+    it("should give the entries the stored expiry, not the extractor's", async () => {
+        await using context = new TestContext()
+        await reindexedSchema
+            .tables(context)
+            .ReindexedLateExpiry.partition('s1')
+            .add('e1', {
+                groupIds: ['g1'],
+                expiresAt: '2000-01-01T00:00:00Z',
+            })
+        reindexedSchema.expiry('ReindexedLateExpiry', document => new Date(document.expiresAt))
+        const byLateGroup = reindexedSchema.index(
+            'ReindexedLateExpiry',
+            'byGroup',
+            r => r.document.groupIds,
+            r => r.key,
+        )
+
+        await byLateGroup(context).reindex('s1', 'e1')
+
+        const found = await byLateGroup(context).partition('g1').first('e1')
+        assert.deepStrictEqual(found?.source, { partition: 's1', key: 'e1' })
+    })
+
+    it('should write the same entries when run again', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped.partition('s1')
+        const revision = await grouped.add('e1', { groupIds: ['g1', 'g2'] })
+
+        await byGroup(context).reindex('s1', 'e1')
+        await byGroup(context).reindex('s1', 'e1')
+
+        const g1 = await Array.fromAsync(
+            byGroup(context).partition('g1').getRange({ withPrefix: '' }),
+        )
+        assert.deepStrictEqual(g1, [
+            {
+                key: 'e1',
+                revision,
+                document: { groupIds: ['g1', 'g2'] },
+                source: { partition: 's1', key: 'e1' },
+            },
+        ])
+    })
+
+    it('should retry when the row is written meanwhile', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped.partition('s1')
+        const revision = await grouped.add('e1', { groupIds: ['g1'] })
+        let interfered = false
+        const remove = decorateDriver(
+            interceptingTransactions(async items => {
+                if (interfered || items[0]?.op !== 'check') {
+                    return
+                }
+                interfered = true
+                await grouped.update('e1', revision, { groupIds: ['g1'], labels: ['x'] })
+            }),
+        )
+        try {
+            await byGroup(context).reindex('s1', 'e1')
+        } finally {
+            remove()
+        }
+
+        const current = await grouped.get('e1')
+        assert.deepStrictEqual(await byGroup(context).partition('g1').first('e1'), {
+            key: 'e1',
+            revision: current.revision,
+            document: { groupIds: ['g1'], labels: ['x'] },
+            source: { partition: 's1', key: 'e1' },
+        })
+    })
+})
+
 function aRental(props?: Partial<Rental>): Rental {
     return {
         name: 'a rental',
@@ -574,4 +727,29 @@ class TestContext {
             await release()
         }
     }
+}
+
+function interceptingTransactions(onTransact: (items: TransactionItem[]) => Promise<void>) {
+    return (driver: Driver): Driver => ({
+        connect: async context => {
+            const inner = await driver.connect(context)
+            return {
+                close: () => inner.close(),
+                add: (table, partition, key, document, options) =>
+                    inner.add(table, partition, key, document, options),
+                get: (table, partition, key, options) => inner.get(table, partition, key, options),
+                getPartitions: table => inner.getPartitions(table),
+                getPartition: (table, partition, range, options) =>
+                    inner.getPartition(table, partition, range, options),
+                update: (table, partition, key, revision, document, options) =>
+                    inner.update(table, partition, key, revision, document, options),
+                delete: (table, partition, key, revision, options) =>
+                    inner.delete(table, partition, key, revision, options),
+                transact: async (items, options) => {
+                    await onTransact(items)
+                    await inner.transact(items, options)
+                },
+            }
+        },
+    })
 }

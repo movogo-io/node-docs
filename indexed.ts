@@ -5,12 +5,13 @@ import {
     indexKeyDelimiter,
     indexTable,
     registerIndex,
+    reindexRow,
     type IndexDefinition,
     type IndexSourceRow,
     type IndexValues,
 } from './lib/indexes.js'
 import { openSession, type Session } from './lib/session.js'
-import { tables, type Context, type Tables } from './partitioned.js'
+import { retryConflict, tables, type Context, type Tables } from './partitioned.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
 type TableNamesOf<Schema> = keyof Schema & string
@@ -73,10 +74,14 @@ type IndexPartitions<Document, PartitionKey extends string> = string extends Par
 
 type IndexPartition<Document> = {
     partition: (partition: string) => Index<Document>
-}
+} & Reindex
 
 type NamedIndexPartition<PartitionKey extends string, Document> = {
     readonly [P in PartitionKey]: Index<Document>
+} & Reindex
+
+type Reindex = {
+    reindex: (sourcePartition: string, sourceKey: string) => Promise<void>
 }
 
 export type IndexRow<Document> = {
@@ -121,6 +126,17 @@ function indexAccessor(definition: IndexDefinition) {
         const p = new Proxy(
             {
                 partition: (partition: string) => new IndexReader(session, definition, partition),
+                reindex: async (sourcePartition: string, sourceKey: string) => {
+                    await retryConflict(async () => {
+                        await reindexRow(
+                            await session.connection,
+                            definition,
+                            sourcePartition,
+                            sourceKey,
+                            session.nowSeconds(),
+                        )
+                    })
+                },
             },
             indexPartitionsProxy(session, definition),
         )

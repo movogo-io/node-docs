@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import type { Connection, ReadOptions, TransactionItem, Written } from './driver.js'
 import { conflict, isNotFound } from './errors.js'
-import { expiryOf, getUnexpired, isoOf } from './expiry.js'
+import { expiryOf, getUnexpired, isExpired, isoOf } from './expiry.js'
 import { maxTransactionItems } from './transaction.js'
 
 // Separates the index key value from the owning row's partition and key in the
@@ -67,6 +67,16 @@ export function indexEntriesOf(
     if (!definitions) {
         return []
     }
+    return entriesOf(table, definitions, partition, key, document)
+}
+
+function entriesOf(
+    table: string,
+    definitions: readonly IndexDefinition[],
+    partition: string,
+    key: string,
+    document: StoredDocument,
+) {
     assertClean(partition, `partition of a row in indexed table '${table}'`)
     assertClean(key, `key of a row in indexed table '${table}'`)
     const row = { partition, key, document }
@@ -103,6 +113,55 @@ function valuesOf(values: IndexValues): readonly string[] {
         return [values]
     }
     return values
+}
+
+// Writes a row's entries in one index without writing the row: the backfill
+// for an index declared after rows were written, which a rewrite would do at
+// the price of a new revision, an audit entry and an announcement per row. The
+// entries carry the row's revision and stored expiry, as a write gives them;
+// the check makes a write landing in between a conflict, so its entries are
+// never overwritten with older ones. Entries an earlier extractor wrote are
+// not found here: they are keyed by values no current extractor produces.
+export async function reindexRow(
+    c: Connection,
+    definition: IndexDefinition,
+    partition: string,
+    key: string,
+    now: number,
+) {
+    const row = await storedRow(c, definition.table, partition, key)
+    if (row === undefined || isExpired(row.expiresAt, now)) {
+        return
+    }
+    const entries = entriesOf(definition.table, [definition], partition, key, row.document)
+    if (entries.length === 0) {
+        return
+    }
+    const check: TransactionItem = {
+        op: 'check',
+        table: definition.table,
+        partition,
+        key,
+        revision: row.revision,
+    }
+    await c.transact(
+        withinItemLimit(
+            [check, ...putItems(entries, row.document, row.revision, row.expiresAt)],
+            1,
+        ),
+        { now },
+    )
+}
+
+async function storedRow(c: Connection, table: string, partition: string, key: string) {
+    try {
+        return await c.get(table, partition, key, { consistent: true })
+    } catch (e) {
+        if (isNotFound(e)) {
+            return undefined
+        }
+        throw e
+    }
 }
 
 export function assertClean(value: string, what: string) {
