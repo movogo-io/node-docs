@@ -20,9 +20,13 @@ export type IndexSourceRow = {
 export type IndexDefinition = {
     readonly table: string
     readonly name: string
-    readonly partition: (row: IndexSourceRow) => string | undefined
-    readonly key: (row: IndexSourceRow) => string | undefined
+    readonly partition: (row: IndexSourceRow) => IndexValues
+    readonly key: (row: IndexSourceRow) => IndexValues
 }
+
+// One value, several (an entry per partition × key pair), or none: a sparse
+// index leaves out a row whose extractor answers `undefined` or `[]`.
+export type IndexValues = string | readonly string[] | undefined
 
 const registry = new Map<string, IndexDefinition[]>()
 
@@ -66,25 +70,39 @@ export function indexEntriesOf(
     assertClean(partition, `partition of a row in indexed table '${table}'`)
     assertClean(key, `key of a row in indexed table '${table}'`)
     const row = { partition, key, document }
-    const entries: IndexEntry[] = []
+    // Keyed by entry, since a repeated value would be two operations on one
+    // item, which a transaction refuses.
+    const entries = new Map<string, IndexEntry>()
     for (const definition of definitions) {
-        const partitionValue = definition.partition(row)
-        if (partitionValue === undefined) {
+        const partitionValues = valuesOf(definition.partition(row))
+        if (partitionValues.length === 0) {
             continue
         }
-        const keyValue = definition.key(row)
-        if (keyValue === undefined) {
-            continue
+        const keyValues = valuesOf(definition.key(row))
+        for (const partitionValue of partitionValues) {
+            assertClean(partitionValue, `partition computed for index '${definition.name}'`)
+            for (const keyValue of keyValues) {
+                assertClean(keyValue, `key computed for index '${definition.name}'`)
+                const entry = {
+                    table: indexTable(definition),
+                    partition: partitionValue,
+                    key: keyValue + indexKeyDelimiter + partition + indexKeyDelimiter + key,
+                }
+                entries.set(entryId(entry), entry)
+            }
         }
-        assertClean(partitionValue, `partition computed for index '${definition.name}'`)
-        assertClean(keyValue, `key computed for index '${definition.name}'`)
-        entries.push({
-            table: indexTable(definition),
-            partition: partitionValue,
-            key: keyValue + indexKeyDelimiter + partition + indexKeyDelimiter + key,
-        })
     }
-    return entries
+    return entries.values().toArray()
+}
+
+function valuesOf(values: IndexValues): readonly string[] {
+    if (values === undefined) {
+        return []
+    }
+    if (typeof values === 'string') {
+        return [values]
+    }
+    return values
 }
 
 export function assertClean(value: string, what: string) {
@@ -124,7 +142,7 @@ export async function addWithIndexes(
         ...expiry,
     }
     const { entries, seq } = replaced ?? (await replacedByAdd(c, item))
-    await c.transact([item, ...addIndexItems(item, entries)], { now })
+    await c.transact(withinItemLimit([item, ...addIndexItems(item, entries)], 1), { now })
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -154,7 +172,7 @@ export async function updateWithIndexes(
     }
     const { entries, seq } =
         replaced ?? replacedOf(table, partition, key, await existingRow(c, item, now))
-    await c.transact([item, ...updateIndexItems(item, entries)], { now })
+    await c.transact(withinItemLimit([item, ...updateIndexItems(item, entries)], 1), { now })
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -171,7 +189,9 @@ export async function deleteWithIndexes(
         return
     }
     const item: Delete = { op: 'delete', table, partition, key, revision }
-    await c.transact([item, ...(await deleteIndexItems(c, item, now))], { now })
+    await c.transact(withinItemLimit([item, ...(await deleteIndexItems(c, item, now))], 1), {
+        now,
+    })
 }
 
 export async function expandIndexOperations(
@@ -210,14 +230,17 @@ export async function expandIndexOperations(
             }
         }),
     )
-    const flat = expanded.flat()
-    if (flat.length > maxTransactionItems) {
+    return withinItemLimit(expanded.flat(), items.length)
+}
+
+function withinItemLimit(items: TransactionItem[], requestedCount: number) {
+    if (maxTransactionItems < items.length) {
         throw new Error(
             `Transaction cannot contain more than ${String(maxTransactionItems)} operations; ` +
-                `${String(items.length)} requested operations expanded to ${String(flat.length)} including index maintenance.`,
+                `${String(requestedCount)} requested operations expanded to ${String(items.length)} including index maintenance.`,
         )
     }
-    return flat
+    return items
 }
 
 function addIndexItems(item: Add, oldEntries: IndexEntry[]): TransactionItem[] {

@@ -7,6 +7,7 @@ import {
     registerIndex,
     type IndexDefinition,
     type IndexSourceRow,
+    type IndexValues,
 } from './lib/indexes.js'
 import { openSession, type Session } from './lib/session.js'
 import { tables, type Context, type Tables } from './partitioned.js'
@@ -46,8 +47,10 @@ export type SchemaHandle<Schema> = {
     index<Table extends TableNamesOf<Schema>, const PartitionKey extends string>(
         table: Table,
         name: string,
-        partition: (row: IndexSource<Schema, Table>) => PartitionKey | undefined,
-        key: (row: IndexSource<Schema, Table>) => string | undefined,
+        partition: (
+            row: IndexSource<Schema, Table>,
+        ) => PartitionKey | readonly PartitionKey[] | undefined,
+        key: (row: IndexSource<Schema, Table>) => string | readonly string[] | undefined,
     ): IndexAccessor<DocumentOf<Schema, Table>, PartitionKey>
     expiry<Table extends TableNamesOf<Schema>>(
         table: Table,
@@ -95,8 +98,8 @@ export function docs<Schema = GenericSchema>(): SchemaHandle<Schema> {
         index: (
             table: string,
             name: string,
-            partition: (row: IndexSourceRow) => string | undefined,
-            key: (row: IndexSourceRow) => string | undefined,
+            partition: (row: IndexSourceRow) => IndexValues,
+            key: (row: IndexSourceRow) => IndexValues,
         ) => {
             const definition = { table, name, partition, key }
             registerIndex(definition)

@@ -388,6 +388,166 @@ describe('indexes', () => {
     })
 })
 
+type Grouped = {
+    groupIds: string[]
+    labels?: string[]
+}
+
+const groupedSchema = docs<{
+    IndexedGrouped: {
+        [supplierId: string]: {
+            [equipmentId: string]: Grouped
+        }
+    }
+}>()
+const byGroup = groupedSchema.index(
+    'IndexedGrouped',
+    'byGroup',
+    r => r.document.groupIds,
+    r => r.key,
+)
+const byGroupAndLabel = groupedSchema.index(
+    'IndexedGrouped',
+    'byGroupAndLabel',
+    r => r.document.groupIds,
+    r => r.document.labels,
+)
+
+describe('multi-entry indexes', () => {
+    beforeEach(() => {
+        setDriver(new DelayedPersistentMemoryDriver())
+    })
+
+    it('should omit a row whose extractor answers no values', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        await grouped.partition('s1').add('e1', { groupIds: [] })
+
+        assert.strictEqual(await byGroup(context).partition('g1').first('e1'), undefined)
+    })
+
+    it('should find a row under each of its values', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        await grouped.partition('s1').add('e1', { groupIds: ['g1', 'g2'] })
+        await grouped.partition('s1').add('e2', { groupIds: ['g2'] })
+
+        const g1 = await Array.fromAsync(
+            byGroup(context).partition('g1').getRange({ withPrefix: '' }),
+            row => row.source,
+        )
+        const g2 = await Array.fromAsync(
+            byGroup(context).partition('g2').getRange({ withPrefix: '' }),
+            row => row.source,
+        )
+        assert.deepStrictEqual(g1, [{ partition: 's1', key: 'e1' }])
+        assert.deepStrictEqual(g2, [
+            { partition: 's1', key: 'e1' },
+            { partition: 's1', key: 'e2' },
+        ])
+    })
+
+    it('should write one entry for a repeated value', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        await grouped.partition('s1').add('e1', { groupIds: ['g1', 'g1'] })
+
+        const keys = await Array.fromAsync(
+            byGroup(context).partition('g1').getRange({ withPrefix: '' }),
+            row => row.key,
+        )
+        assert.deepStrictEqual(keys, ['e1'])
+    })
+
+    it('should move only the entry of a value that changed', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        const revision = await grouped.partition('s1').add('e1', { groupIds: ['g1', 'g2', 'g3'] })
+
+        await grouped.partition('s1').update('e1', revision, { groupIds: ['g1', 'g4', 'g3'] })
+
+        const found = await Promise.all(
+            ['g1', 'g2', 'g3', 'g4'].map(
+                async group => (await byGroup(context).partition(group).first('e1'))?.document,
+            ),
+        )
+        assert.deepStrictEqual(found, [
+            { groupIds: ['g1', 'g4', 'g3'] },
+            undefined,
+            { groupIds: ['g1', 'g4', 'g3'] },
+            { groupIds: ['g1', 'g4', 'g3'] },
+        ])
+    })
+
+    it('should remove every entry of a deleted row', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        const revision = await grouped.partition('s1').add('e1', { groupIds: ['g1', 'g2'] })
+
+        await grouped.partition('s1').delete('e1', revision)
+
+        assert.strictEqual(await byGroup(context).partition('g1').first('e1'), undefined)
+        assert.strictEqual(await byGroup(context).partition('g2').first('e1'), undefined)
+    })
+
+    it('should write every partition and key pair once', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        await grouped.partition('s1').add('e1', {
+            groupIds: ['g1', 'g2', 'g1'],
+            labels: ['b', 'a', 'b'],
+        })
+
+        const g1 = await Array.fromAsync(
+            byGroupAndLabel(context).partition('g1').getRange({ withPrefix: '' }),
+            row => [row.key, row.source.key],
+        )
+        const g2 = await Array.fromAsync(
+            byGroupAndLabel(context).partition('g2').getRange({ withPrefix: '' }),
+            row => [row.key, row.source.key],
+        )
+        assert.deepStrictEqual(g1, [
+            ['a', 'e1'],
+            ['b', 'e1'],
+        ])
+        assert.deepStrictEqual(g2, [
+            ['a', 'e1'],
+            ['b', 'e1'],
+        ])
+    })
+
+    it('should refuse a single write whose entries exceed the transaction limit', async () => {
+        await using context = new TestContext()
+        const grouped = groupedSchema.tables(context).IndexedGrouped
+        const groupIds = Array.from({ length: 100 }, (_, i) => `g${String(i)}`)
+
+        await assert.rejects(
+            grouped.partition('s1').add('e1', { groupIds }),
+            /1 requested operations expanded to 101/u,
+        )
+
+        assert.strictEqual(await grouped.partition('s1').find('e1'), undefined)
+    })
+
+    it('should count every entry toward the limit of a transaction', async () => {
+        await using context = new TestContext()
+        const groupIds = Array.from({ length: 30 }, (_, i) => `g${String(i)}`)
+
+        await assert.rejects(
+            withTransaction<{
+                IndexedGrouped: { [supplierId: string]: { [id: string]: Grouped } }
+            }>(context, async tx => {
+                for (let i = 0; i !== 4; ++i) {
+                    await tx.IndexedGrouped.partition('s1').add(`e${String(i)}`, { groupIds })
+                }
+            }),
+            /4 requested operations expanded to 124/u,
+        )
+
+        assert.strictEqual(await byGroup(context).partition('g0').first('e0'), undefined)
+    })
+})
+
 function aRental(props?: Partial<Rental>): Rental {
     return {
         name: 'a rental',
