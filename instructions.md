@@ -143,31 +143,22 @@ export function invitations(context: object) {
 }
 ```
 
-You may then not need to export the `Schema` type. Where absence has a default, `find` says so in one line; `isNotFound` and `isConflict` identify the store's errors where a `try` is still needed, such as an `add` that may lose a race:
+You may then not need to export the `Schema` type. Where absence has a default, `find` says so in one line:
 
 ```ts
 async function getUserProfile(context: object, userId: string) {
     const row = await userProfiles(context).find(userId);
     return row?.document ?? { ...defaultProfiles };
 }
-
-async function updateUserProfile(context: object, userId: string, newProfile, revision) {
-    try {
-        return await userProfiles(context).update(userId, revision, newProfile);
-    } catch (e) {
-        if (isConflict(e)) {
-            // TODO: Retry
-        }
-        throw e;
-    }
-}
 ```
+
+`isNotFound` and `isConflict` identify the store's errors where a `try` is still needed. A conflict is not handled with a `try`, though: it is retried.
 
 Not-found and conflict errors carry `statusCode` 404 and 409, so one that escapes a @riddance/service handler — typically a conflict once the retries of a helper or `withTransaction` are spent — is answered 404 or 409, not 500. `isNotFound` and `isConflict` identify errors raised by the store, not any 404 or 409: an error carrying only `statusCode`, such as one from `@riddance/service`, does not match, so a domain conflict thrown inside a retrying helper is not retried and not mistaken for contention.
 
 Range bounds are inclusive for `after` and exclusive for `before`, and an empty string is a bound like any other: `{ after: '' }` matches every key and `{ before: '' }` none.
 
-`getOrAdd`, `addOrUpdate`, `converge` on `DocumentSet` are helper functions that manages concurrency issues by retrying conflict errors. Their `document` argument is added if it doesn't exist, `update` is called if it does exist, and `target` determines if the document needs updating. The `update` callback may either mutate the existing document in place, or return a replacement document; when it returns a document, that document is persisted instead of the existing one. That makes whole-document replacement (PUT semantics) a one-liner:
+`getOrAdd`, `addOrUpdate`, `converge` on `DocumentSet` are helper functions that manage concurrency issues by retrying conflict errors, as `retryConflict` does. Their `document` argument is added if it doesn't exist, `update` is called if it does exist, and `target` determines if the document needs updating. The `update` callback may either mutate the existing document in place, or return a replacement document; when it returns a document, that document is persisted instead of the existing one. That makes whole-document replacement (PUT semantics) a one-liner:
 
 ```ts
 documents.addOrUpdate(key, newDocument, () => newDocument);
@@ -191,6 +182,31 @@ documents.converge(
     },
 );
 ```
+
+## Retrying conflicts
+
+A read-modify-write that the helpers above cannot express, because it decides on the document before writing it (a state transition that refuses, a write whose revision a client sent), goes through `retryConflict`:
+
+```ts
+import { retryConflict } from "@movogo-io/docs";
+
+const written = await retryConflict(async () => {
+    const row = await rentals(context, supplierId).get(rentalId);
+    if (row.document.status !== "active") {
+        throw fail("rental.not_active");
+    }
+    const next = { ...row.document, status: "completed", completedAt: context.now().toISOString() };
+    return await rentals(context, supplierId).update(rentalId, row.revision, next);
+});
+```
+
+`retryConflict(fn, options?)` runs `fn` again when it throws a conflict of the store, after a jittered delay, and rethrows anything else at once. `retries` (default 3) caps the reruns, so sustained contention ends in the conflict, which a handler answers as a 409 the client retries, instead of a livelock; `delay` (default 250 ms, jittered between half and one and a half times) spaces them; `signal` aborts the wait. Use the defaults: they are the ones the helpers and `withTransaction` retry with, so one service does not contend differently in one handler than in the next.
+
+- **Read inside `fn`, and decide inside it.** A revision read before the call fails identically on every rerun, and a state or ownership check made on a row read outside it passes on a document the rerun no longer writes against.
+- **Mint ids and timestamps inside `fn`,** and when `fn` writes several documents, write first the one most likely to conflict. An id minted outside, with a later write losing the race, makes the rerun conflict with its own previous attempt's first write.
+- **`fn` must be safe to run again:** no emit, no outbound call, nothing but reads and store writes. Do those after `retryConflict` returns.
+- Only the store's conflicts are retried. A refusal carrying `statusCode: 409` of its own, a domain conflict or a package's (`queue.not_dead_lettered`), is a verdict on the document and is thrown at once; retrying it would only repeat it.
+- Several documents that must change together are one `withTransaction`, which retries the whole callback the same way, not several writes inside one `retryConflict`.
 
 ## Transactions
 
