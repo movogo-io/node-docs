@@ -641,19 +641,24 @@ function throwIfOverLimits(items: TransactionItem[]) {
     }
 }
 
-// An estimate of the item DynamoDB stores, erring high: the document as the
-// JSON string the DynamoDB driver writes, the key, and an allowance for the
-// revision, counters and timestamps beside them. An operation without a
-// document sends only its key.
+// DynamoDB measures the request, not the items it stores: 14 documents of
+// 300 KB sent through the DynamoDB driver measured 393 bytes each beyond the
+// document's JSON string, for the table name, key, revision, timestamps and
+// the update expressions around them. The allowance stays above that, so
+// the estimate errs high. An operation without a document sends only its
+// table and key.
 function itemBytes(item: TransactionItem) {
-    const keyBytes = Buffer.byteLength(item.partition) + Buffer.byteLength(item.key)
+    const keyBytes =
+        Buffer.byteLength(item.table) +
+        Buffer.byteLength(item.partition) +
+        Buffer.byteLength(item.key)
     if ('document' in item) {
         return keyBytes + Buffer.byteLength(JSON.stringify(item.document)) + envelopeBytes
     }
     return keyBytes
 }
 
-const envelopeBytes = 256
+const envelopeBytes = 512
 
 function tablesOf(items: TransactionItem[]) {
     return [...new Set(items.map(item => `'${item.table}'`))].join(', ')
