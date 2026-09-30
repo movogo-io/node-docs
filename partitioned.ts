@@ -1327,4 +1327,5 @@ export async function retryConflict<T>(fn: () => Promise<T>, options?: RetryOpti
 }
 
 export { isConflict, isNotFound } from './lib/errors.js'
+export { compositeKey, compositeRange } from './lib/keys.js'
 export type { ReadOptions } from './lib/driver.js'

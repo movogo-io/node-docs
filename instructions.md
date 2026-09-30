@@ -288,11 +288,11 @@ An extractor may also return an array: the row then gets an entry for every part
 export const equipmentByGroup = schema.index(
     "Equipment",
     "byGroup",
-    (r) => r.document.groupIds.map((groupId) => JSON.stringify([r.partition, groupId])), // one partition per group
+    (r) => r.document.groupIds.map((groupId) => compositeKey(r.partition, groupId)), // one partition per group
     (r) => r.key,
 );
 
-for await (const r of equipmentByGroup(context).partition(JSON.stringify([supplierId, groupId])).getRange({ after })) {
+for await (const r of equipmentByGroup(context).partition(compositeKey(supplierId, groupId)).getRange({ after })) {
     // one page of the group's equipment
 }
 ```
@@ -304,11 +304,42 @@ Rules and properties:
 - **Index rows carry the document and its revision, but not `seq` or `updatedAt`.** A row read through an index can be updated directly: `rentals(context, row.source.partition).update(row.source.key, row.revision, …)`. An entry keeps its own write counter, which is not the source document's, so neither is exposed; read the document itself for its `seq`.
 - **Index keys are not unique.** Several rows may share one, so the point lookups are `first(key)` and `firstDocument(key)`: they return the first match in key order, or `undefined` when nothing matches. `getRange` accepts the same ranges as `getRange` on a table. Both, and `firstDocument`, take the trailing `{ consistent: true }` of a table read.
 - **The character `"\u0000"` is reserved** in partitions, keys, and extractor results of indexed tables.
-- **A multi-valued membership goes in the partition, the member's key in the key.** A range is either `withPrefix` or `after`/`before`, never both, so values encoded in the key cannot be paged with `after` within one value; a value in the partition pages with a plain `after`. Repeated values give one entry. A range spanning several values of one row returns that row once per value: count documents by `source`, not by rows.
+- **A multi-valued membership goes in the partition, the member's key in the key.** A range is either `withPrefix` or `after`/`before`, never both, so a value in the partition, paged with a plain `after`, is the simplest layout; a value that must stay in the key, such as a date the index is ranged by, is paged within one value with `compositeRange` (see *Composite keys*). Repeated values give one entry. A range spanning several values of one row returns that row once per value: count documents by `source`, not by rows.
 - **Extractors must handle every document shape ever stored.** A write computes the entries of the document it replaces, including an expired one under the same key, so an extractor that throws on a legacy shape makes `add`, `update`, and `delete` of that key fail.
 - **Cost:** every write to an indexed table is a transaction of the document plus one item per index entry it adds, replaces, or removes, and each entry stores a copy of the document. Every write puts every entry again, not only the ones that changed, so a document with ten entries writes eleven copies of itself on a change to any field, twelve on an audited table. A single write is refused before it reaches the driver when its entries take it past 100 operations, and the 4 MB and 100-operation limits of a transaction (see Transactions) arrive sooner the more entries a document has. An `add`, `update`, or `delete` additionally reads the current document first, to find the entries to remove, including those an expired document left behind, unless it runs through a retry helper that has already read it. That read is eventual; a revision other than the caller's is read again consistently before the write is called a conflict, so a row this process updated milliseconds earlier does not fail its own next update on a stale replica. Index maintenance operations also count toward the 100-operation transaction budget inside `withTransaction`.
 - **Backfill with `reindex`, not by rewriting.** Entries are only written when their document is written, so rows written before an index was declared, or before its extractor changed, are missing from it. `index(context).reindex(sourcePartition, sourceKey)` writes one row's entries in that index and leaves the row alone: the entries carry the row's revision and stored expiry, a write landing in between makes it retry, and an absent or expired row writes nothing. A rewrite would do the same at the price of a new revision (stale `If-Match` for every client), an audit entry and a `document.changed` per row. Sweep the table with `getAll` and call `reindex` per row; it is idempotent, so the sweep can be re-run.
 - **A changed extractor needs a new index name.** Cleanup computes old entries with the *current* extractors, and so does `reindex`, so entries an old extractor wrote are keyed by values nothing computes any more and are never cleared. Give the changed index a new name, backfill it, and drop the old shadow table, named `<Table>.<indexName>`.
+
+## Composite keys
+
+A partition or key built from several values goes through `compositeKey`, in the extractor that writes it and in the reader that looks it up, so no reader can build a key the extractor did not:
+
+```ts
+import { compositeKey, compositeRange } from "@movogo-io/docs";
+
+// One entry per equipment and depot, the unit last; the tenant is the partition.
+export const unitsByEquipment = schema.index(
+    "FleetUnits",
+    "byEquipment",
+    (r) => compositeKey(r.partition, r.document.equipmentId),
+    (r) => compositeKey(r.document.depotId, r.key),
+);
+
+// Every unit of one equipment at one depot, a page at a time.
+const partition = compositeKey(supplierId, equipmentId);
+const range = compositeRange([depotId], after);
+if (partition !== undefined && range !== undefined) {
+    for await (const r of unitsByEquipment(context).partition(partition).getRange(range)) {
+        // r.key is the cursor of the next page
+    }
+}
+```
+
+- **One-to-one, whatever the ids hold.** Parts are joined with `#`, and `%`, `#` and the reserved `\u0000` are percent-escaped in each part, so `("a#b", "c")` and `("a", "b#c")` never share a key, and no id can carry the reserved character into a key.
+- **`undefined` for a missing part, never a throw.** Any part that is not a non-empty string gives `undefined`, which an extractor returns as it is to leave the row out of the index: a row of an older shape lacking a field is left out instead of failing its write. A reader that gets `undefined` for its own ids has named no rows.
+- **`compositeRange(prefix, after?)`** is the `{ after, before }` range of every key whose leading parts are `prefix`, and nothing else: a longer id that merely starts with the same characters is outside it. `after` continues a page inside the prefix and, like any `after`, is inclusive; `undefined` means the prefix names no key or the cursor lies past the range. Use it rather than `withPrefix` wherever the prefix is paged, since a range is either `withPrefix` or `after`/`before`, never both.
+- **Keys sort by their first part, then the next, only while every character of every part sorts after `#`.** A space, `!`, `"` or control character sorts before the separator, so `("a!", "b")` sorts before `("a", "z")`; a date or timestamp part (`YYYY-MM-DD`, ISO instants) holds none of them and sorts chronologically. Prefix ranges are exact whatever the parts hold.
+- **Changing to `compositeKey` changes the extractor.** An index whose extractor joined values another way gets a new name and a backfill with `reindex` (see *Secondary Indexes*). A table key built another way is a different key: the stored rows keep theirs until they are migrated.
 
 ## Expiry
 
