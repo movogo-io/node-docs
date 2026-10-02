@@ -56,6 +56,21 @@ describe('driver decoration', () => {
         assert.deepStrictEqual(await declaredLimits({}), {})
     })
 
+    it('refuses a declared limit that is not a positive integer', async () => {
+        const memory = new MemoryDriver()
+        setDriver({
+            connect: async () => ({
+                ...delegating('declaring', seen, await memory.connect({})),
+                transactionItemsMax: 0,
+            }),
+        })
+
+        await assert.rejects(
+            declaredLimits({}),
+            /transactionItemsMax 0; it must be a positive integer/u,
+        )
+    })
+
     it('wraps later decorators around earlier ones', async () => {
         removers.push(
             decorateDriver(recording('inner', seen)),

@@ -281,6 +281,22 @@ describe('transactEach', () => {
         assert.strictEqual((await rentalsOf(context)).length, 10)
     })
 
+    it('should refuse a bound that is not a positive integer and write nothing', async () => {
+        await using context = new TestContext()
+
+        for (const requestsInFlightMax of [NaN, 0, -1, 2.5]) {
+            spyOnTransactions({ requestsInFlightMax })
+            await assert.rejects(
+                transactEach<Schema, string>(context, ['r1', 'r2'], async (tx, key) => {
+                    await tx.Rentals.partition('s1').add(key, { name: key, count: 1 })
+                }),
+                /requestsInFlightMax .* must be a positive integer/u,
+            )
+        }
+
+        assert.deepStrictEqual(await rentalsOf(context), [])
+    })
+
     it('should start no window once the signal is aborted', async () => {
         await using context = new TestContext()
         const keys = Array.from({ length: 20 }, (_, i) => `r${String(i).padStart(2, '0')}`)

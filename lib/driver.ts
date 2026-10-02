@@ -222,17 +222,34 @@ export function decorateDriver(decorator: (driver: Driver) => Driver) {
 export async function declaredLimits(context: Context) {
     const c = await getDriver().connect(context)
     try {
+        const requestsInFlightMax = validBound(c, 'requestsInFlightMax')
+        const transactionItemsMax = validBound(c, 'transactionItemsMax')
         return {
-            ...(c.requestsInFlightMax !== undefined && {
-                requestsInFlightMax: c.requestsInFlightMax,
-            }),
-            ...(c.transactionItemsMax !== undefined && {
-                transactionItemsMax: c.transactionItemsMax,
-            }),
+            ...(requestsInFlightMax !== undefined && { requestsInFlightMax }),
+            ...(transactionItemsMax !== undefined && { transactionItemsMax }),
         }
     } finally {
         await c.close()
     }
+}
+
+export function declaredBound(c: Connection, name: Bound, fallback: number) {
+    return validBound(c, name) ?? fallback
+}
+
+type Bound = 'requestsInFlightMax' | 'transactionItemsMax'
+
+// A bound that is not a positive integer is a misconfigured driver, and the
+// store's loops step by it: NaN skips every item, 0 never ends, a fraction
+// sends one item twice.
+function validBound(c: Connection, name: Bound) {
+    const bound = c[name]
+    if (bound === undefined || (Number.isSafeInteger(bound) && bound > 0)) {
+        return bound
+    }
+    throw new Error(
+        `A connection declares ${name} ${String(bound)}; it must be a positive integer.`,
+    )
 }
 
 export function getDriver() {

@@ -1,5 +1,5 @@
 import type { StoredDocument } from '../schema.js'
-import type { Connection, ReadOptions } from './driver.js'
+import { declaredBound, type Connection, type ReadOptions } from './driver.js'
 import { isNotFound, notFound } from './errors.js'
 
 const registry = new Map<string, (document: StoredDocument) => Date | undefined>()
@@ -112,7 +112,7 @@ async function getManyRaw(
         return await c.getMany(table, refs, options)
     }
     const rows: Awaited<ReturnType<Connection['get']>>[] = []
-    const inFlight = c.requestsInFlightMax ?? inFlightMax
+    const inFlight = declaredBound(c, 'requestsInFlightMax', inFlightMax)
     for (let start = 0; start < refs.length; start += inFlight) {
         const chunk = await Promise.all(
             refs.slice(start, start + inFlight).map(ref => getRaw(c, table, ref, options)),

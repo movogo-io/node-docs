@@ -16,9 +16,14 @@ import {
     replacedOf,
     updateWithIndexes,
 } from './lib/indexes.js'
-import type { Connection, ReadOptions, TransactionItem } from './lib/driver.js'
+import {
+    declaredBound,
+    type Connection,
+    type ReadOptions,
+    type TransactionItem,
+} from './lib/driver.js'
 import { openSession, type Session } from './lib/session.js'
-import { TransactionBuffer } from './lib/transaction.js'
+import { maxTransactionItems, TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
 
 // Intersected with `object` so it is not a weak type: a context with other
@@ -868,7 +873,9 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
 ): Promise<T> {
     return await withConnection(context, async (session, c) => {
         return await retryConflict(async () => {
-            const buffer = new TransactionBuffer(c.transactionItemsMax)
+            const buffer = new TransactionBuffer(
+                declaredBound(c, 'transactionItemsMax', maxTransactionItems),
+            )
             const result = await fn(transactionTables<Schema>(session, buffer))
             const now = session.nowSeconds()
             const items = await expandIndexOperations(c, buffer.seal(), now)
@@ -899,7 +906,7 @@ export async function transactEach<Schema = GenericSchema, Item = unknown, T = v
 ): Promise<T[]> {
     return await withConnection(context, async (session, c) => {
         const results: T[] = []
-        const window = c.requestsInFlightMax ?? inFlightMax
+        const window = declaredBound(c, 'requestsInFlightMax', inFlightMax)
         for (let start = 0; start < items.length; start += window) {
             options?.signal?.throwIfAborted()
             const build = (item: Item) => buildUnit(session, c, fn, item)
@@ -944,7 +951,9 @@ async function buildUnit<Schema, Item, T>(
     fn: (tx: TransactionTables<Schema>, item: Item) => Promise<T>,
     item: Item,
 ): Promise<Unit<T>> {
-    const buffer = new TransactionBuffer(c.transactionItemsMax)
+    const buffer = new TransactionBuffer(
+        declaredBound(c, 'transactionItemsMax', maxTransactionItems),
+    )
     try {
         const result = await fn(transactionTables<Schema>(session, buffer), item)
         const now = session.nowSeconds()

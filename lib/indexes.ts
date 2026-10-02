@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
-import type { Connection, ReadOptions, TransactionItem, Written } from './driver.js'
+import {
+    declaredBound,
+    type Connection,
+    type ReadOptions,
+    type TransactionItem,
+    type Written,
+} from './driver.js'
 import { conflict, isNotFound, transactionTooLarge } from './errors.js'
 import { expiryOf, getUnexpired, isExpired, isoOf } from './expiry.js'
 import { maxTransactionItems } from './transaction.js'
@@ -294,7 +300,7 @@ export async function expandIndexOperations(
 }
 
 function withinItemLimit(c: Connection, items: TransactionItem[], requestedCount: number) {
-    const itemsMax = c.transactionItemsMax ?? maxTransactionItems
+    const itemsMax = declaredBound(c, 'transactionItemsMax', maxTransactionItems)
     if (itemsMax < items.length) {
         throw transactionTooLarge(
             `Transaction cannot contain more than ${String(itemsMax)} operations; ` +

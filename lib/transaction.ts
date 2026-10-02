@@ -14,7 +14,7 @@ export class TransactionBuffer {
     readonly #itemsMax
     #sealed = false
 
-    constructor(itemsMax = maxTransactionItems) {
+    constructor(itemsMax: number) {
         this.#itemsMax = itemsMax
     }
 
