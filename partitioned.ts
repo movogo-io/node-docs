@@ -12,7 +12,7 @@ import {
 import {
     addWithIndexes,
     deleteWithIndexes,
-    expandIndexOperations,
+    expandWrites,
     replacedOf,
     updateWithIndexes,
 } from './lib/indexes.js'
@@ -400,7 +400,15 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
             async add(partition: string, document: unknown) {
                 const c = await session.connection
                 return (
-                    await addWithIndexes(c, table, partition, key, document, session.nowSeconds())
+                    await addWithIndexes(
+                        c,
+                        session.context,
+                        table,
+                        partition,
+                        key,
+                        document,
+                        session.nowSeconds(),
+                    )
                 ).revision
             },
             async get(partition: string, options?: ReadOptions) {
@@ -438,6 +446,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 return (
                     await updateWithIndexes(
                         c,
+                        session.context,
                         table,
                         partition,
                         key,
@@ -456,6 +465,7 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 return (
                     await updateWithIndexes(
                         c,
+                        session.context,
                         table,
                         row.partition,
                         key,
@@ -519,7 +529,15 @@ function tableBase(db: ReturnType<typeof tablesBase>, table: string) {
                 ),
             async delete(partition: string, revision: Revision) {
                 const c = await session.connection
-                await deleteWithIndexes(c, table, partition, key, revision, session.nowSeconds())
+                await deleteWithIndexes(
+                    c,
+                    session.context,
+                    table,
+                    partition,
+                    key,
+                    revision,
+                    session.nowSeconds(),
+                )
             },
         }),
         partition: (partition: string) => new Partition(session, table, partition),
@@ -552,6 +570,7 @@ class Partition {
         return (
             await addWithIndexes(
                 c,
+                this.#session.context,
                 this.#table,
                 this.#partition,
                 key,
@@ -615,6 +634,7 @@ class Partition {
         return (
             await updateWithIndexes(
                 c,
+                this.#session.context,
                 this.#table,
                 this.#partition,
                 key,
@@ -629,6 +649,7 @@ class Partition {
         return (
             await updateWithIndexes(
                 c,
+                this.#session.context,
                 this.#table,
                 this.#partition,
                 row.key,
@@ -724,6 +745,7 @@ class Partition {
         const c = await this.#session.connection
         await deleteWithIndexes(
             c,
+            this.#session.context,
             this.#table,
             this.#partition,
             key,
@@ -872,18 +894,22 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
     options?: RetryOptions,
 ): Promise<T> {
     return await withConnection(context, async (session, c) => {
-        return await retryConflict(async () => {
+        const { result, committed } = await retryConflict(async () => {
             const buffer = new TransactionBuffer(
                 declaredBound(c, 'transactionItemsMax', maxTransactionItems),
             )
-            const result = await fn(transactionTables<Schema>(session, buffer))
+            const returned = await fn(transactionTables<Schema>(session, buffer))
             const now = session.nowSeconds()
-            const items = await expandIndexOperations(c, buffer.seal(), now)
-            if (items.length !== 0) {
-                await c.transact(items, { now })
+            const expanded = await expandWrites(c, session.context, buffer.seal(), now)
+            if (expanded.items.length !== 0) {
+                await c.transact(expanded.items, { now })
             }
-            return result
+            return { result: returned, committed: expanded.committed }
         }, options)
+        // Outside the retry: the transaction has committed, and nothing
+        // thrown from here may send it again.
+        committed()
+        return result
     })
 }
 
@@ -940,7 +966,7 @@ async function withConnection<T>(
 // A unit as its callback left it: the transaction it sends, or what it threw,
 // with whatever it had buffered by then.
 type Unit<T> =
-    | { items: TransactionItem[]; now: number; result: T }
+    | { items: TransactionItem[]; now: number; result: T; committed: () => void }
     | { items: TransactionItem[]; error: unknown }
 
 type Outcome<T> = { result: T; items: TransactionItem[] } | { error: unknown }
@@ -957,7 +983,8 @@ async function buildUnit<Schema, Item, T>(
     try {
         const result = await fn(transactionTables<Schema>(session, buffer), item)
         const now = session.nowSeconds()
-        return { items: await expandIndexOperations(c, buffer.seal(), now), now, result }
+        const { items, committed } = await expandWrites(c, session.context, buffer.seal(), now)
+        return { items, now, result, committed }
     } catch (error) {
         return { items: buffer.seal(), error }
     }
@@ -1017,6 +1044,7 @@ async function settleUnit<T>(
 ): Promise<Outcome<T>> {
     let unit = first
     for (let remaining = options?.retries ?? 3; ; --remaining) {
+        let sent: Extract<Unit<T>, { result: T }> | undefined
         try {
             if ('error' in unit) {
                 throw unit.error
@@ -1024,11 +1052,16 @@ async function settleUnit<T>(
             if (unit.items.length !== 0) {
                 await c.transact(unit.items, { now: unit.now })
             }
-            return { result: unit.result, items: unit.items }
+            sent = unit
         } catch (error) {
             if (!remaining || !isConflict(error)) {
                 return { error }
             }
+        }
+        // Outside the catch: a unit that committed is never failed or rebuilt.
+        if (sent) {
+            sent.committed()
+            return { result: sent.result, items: sent.items }
         }
         try {
             await conflictDelay(options)
@@ -1287,7 +1320,16 @@ async function getOrAdd(
             return live
         }
         const replaced = replacedOf(table, partition, key, expired)
-        const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+        const written = await addWithIndexes(
+            c,
+            session.context,
+            table,
+            partition,
+            key,
+            document,
+            now,
+            replaced,
+        )
         return { partition, key, document, ...written }
     }, options)
 }
@@ -1316,7 +1358,16 @@ async function getOrAddComputed<T>(
         }
         const document = await callback()
         const replaced = replacedOf(table, partition, key, expired)
-        const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+        const written = await addWithIndexes(
+            c,
+            session.context,
+            table,
+            partition,
+            key,
+            document,
+            now,
+            replaced,
+        )
         return { partition, key, document, ...written }
     }, options)
 }
@@ -1343,13 +1394,23 @@ async function addOrUpdate<T>(
         )
         if (!live) {
             const replaced = replacedOf(table, partition, key, expired)
-            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            const written = await addWithIndexes(
+                c,
+                session.context,
+                table,
+                partition,
+                key,
+                document,
+                now,
+                replaced,
+            )
             return { action: 'add', partition, key, document, ...written }
         }
         const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
         const written = await updateWithIndexes(
             c,
+            session.context,
             table,
             partition,
             key,
@@ -1385,13 +1446,23 @@ async function addOrUpdateComputed<T>(
         if (!live) {
             const document = await computed()
             const replaced = replacedOf(table, partition, key, expired)
-            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            const written = await addWithIndexes(
+                c,
+                session.context,
+                table,
+                partition,
+                key,
+                document,
+                now,
+                replaced,
+            )
             return { action: 'add', partition, key, document, ...written }
         }
         const replaced = replacedOf(table, partition, key, live)
         const updated = update(live.document as T) ?? (live.document as T)
         const written = await updateWithIndexes(
             c,
+            session.context,
             table,
             partition,
             key,
@@ -1428,7 +1499,16 @@ async function converge<T>(
         )
         if (!live) {
             const replaced = replacedOf(table, partition, key, expired)
-            const written = await addWithIndexes(c, table, partition, key, initial, now, replaced)
+            const written = await addWithIndexes(
+                c,
+                session.context,
+                table,
+                partition,
+                key,
+                initial,
+                now,
+                replaced,
+            )
             return { partition, key, document: initial, ...written }
         }
         if (target(live.document as T)) {
@@ -1439,6 +1519,7 @@ async function converge<T>(
         assert.ok(target(updated), 'Updated document does not meet target.')
         const written = await updateWithIndexes(
             c,
+            session.context,
             table,
             partition,
             key,
@@ -1476,7 +1557,16 @@ async function convergeComputed<T>(
             const document = await initial()
             assert.ok(target(document), 'Initial document does not meet target.')
             const replaced = replacedOf(table, partition, key, expired)
-            const written = await addWithIndexes(c, table, partition, key, document, now, replaced)
+            const written = await addWithIndexes(
+                c,
+                session.context,
+                table,
+                partition,
+                key,
+                document,
+                now,
+                replaced,
+            )
             return { partition, key, document, ...written }
         }
         if (target(live.document as T)) {
@@ -1487,6 +1577,7 @@ async function convergeComputed<T>(
         assert.ok(target(updated), 'Updated document does not meet target.')
         const written = await updateWithIndexes(
             c,
+            session.context,
             table,
             partition,
             key,

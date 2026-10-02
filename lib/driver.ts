@@ -183,11 +183,29 @@ function claimProcess() {
     return copy
 }
 
+// A document write of a table an extension applies to, as the store is about
+// to send it: the revision it mints is decided, and a delete carries the
+// document it removes, read by the store at the revision it deletes.
+export type ExtendedWrite =
+    | Extract<TransactionItem, { op: 'add' | 'update' }>
+    | (Extract<TransactionItem, { op: 'delete' }> & { readonly document: StoredDocument })
+
+export type Extended = {
+    readonly items: TransactionItem[]
+    readonly committed?: () => void
+}
+
+export type WriteExtension = {
+    readonly applies: (table: string) => boolean
+    readonly prepare: (context: object, writes: readonly ExtendedWrite[]) => Extended
+}
+
 const state: {
     copy: { version: string; url: string }
     driver: Driver
     decorators: ((driver: Driver) => Driver)[]
     decorated?: Driver
+    extensions: WriteExtension[]
 } = {
     copy: claimProcess(),
     driver: {
@@ -195,6 +213,48 @@ const state: {
             Promise.reject<Connection>(new Error('No driver set, please call setDriver()')),
     },
     decorators: [],
+    extensions: [],
+}
+
+// The store hands every add, update and delete of a table the extension
+// applies to, once per transaction, to `prepare` before sending it, appends
+// the items it answers, and calls `committed` once the transaction committed.
+// `prepare` may run for a transaction that is never sent, so it must not
+// mutate anything; `committed` must not throw, since the write it follows has
+// already committed.
+export function extendWrites(extension: WriteExtension) {
+    if (state.extensions.includes(extension)) {
+        throw new Error('The write extension is already registered.')
+    }
+    state.extensions.push(extension)
+    return () => {
+        const index = state.extensions.indexOf(extension)
+        if (index !== -1) {
+            state.extensions.splice(index, 1)
+        }
+    }
+}
+
+export function isExtended(table: string) {
+    return state.extensions.some(extension => extension.applies(table))
+}
+
+export function prepareExtensions(
+    context: object,
+    writes: readonly ExtendedWrite[],
+): { items: TransactionItem[]; committed: () => void } {
+    const prepared = state.extensions.flatMap(extension => {
+        const applying = writes.filter(write => extension.applies(write.table))
+        return applying.length === 0 ? [] : [extension.prepare(context, applying)]
+    })
+    return {
+        items: prepared.flatMap(extended => extended.items),
+        committed: () => {
+            for (const extended of prepared) {
+                extended.committed?.()
+            }
+        },
+    }
 }
 
 export function setDriver(driver: Driver) {

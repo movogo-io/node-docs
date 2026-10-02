@@ -2,13 +2,16 @@ import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import {
     declaredBound,
+    isExtended,
+    prepareExtensions,
     type Connection,
+    type ExtendedWrite,
     type ReadOptions,
     type TransactionItem,
     type Written,
 } from './driver.js'
 import { conflict, isNotFound, transactionTooLarge } from './errors.js'
-import { expiryOf, getUnexpired, isExpired, isoOf } from './expiry.js'
+import { expiryOf, getUnexpired, inFlightMax, isExpired, isoOf } from './expiry.js'
 import { maxTransactionItems } from './transaction.js'
 
 // Separates the index key value from the owning row's partition and key in the
@@ -181,12 +184,19 @@ type Add = Extract<TransactionItem, { op: 'add' }>
 type Update = Extract<TransactionItem, { op: 'update' }>
 type Delete = Extract<TransactionItem, { op: 'delete' }>
 
-// A table without indexes is written through `add`, which answers what it
-// stored. An indexed table is written in a transaction, which answers nothing:
-// `seq` and `updatedAt` are then what the driver stores for a write over the
-// row read beforehand, `replaced` when the caller read it, or a read here.
+// A table with indexes, or one a write extension applies to, is written in a
+// transaction, which carries the items they add.
+function transactional(table: string) {
+    return hasIndexes(table) || isExtended(table)
+}
+
+// A table written plainly goes through `add`, which answers what it stored. A
+// transaction answers nothing: `seq` and `updatedAt` are then what the driver
+// stores for a write over the row read beforehand, `replaced` when the caller
+// read it, or a read here.
 export async function addWithIndexes(
     c: Connection,
+    context: object,
     table: string,
     partition: string,
     key: string,
@@ -195,7 +205,7 @@ export async function addWithIndexes(
     replaced?: Replaced,
 ): Promise<Written> {
     const expiry = expiryOf(table, document)
-    if (!hasIndexes(table)) {
+    if (!transactional(table)) {
         return await c.add(table, partition, key, document, { now, ...expiry })
     }
     const item: Add = {
@@ -208,12 +218,13 @@ export async function addWithIndexes(
         ...expiry,
     }
     const { entries, seq } = replaced ?? (await replacedByAdd(c, item))
-    await c.transact(withinItemLimit(c, [item, ...addIndexItems(item, entries)], 1), { now })
+    await transactOne(c, context, item, item, addIndexItems(item, entries), now)
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
 export async function updateWithIndexes(
     c: Connection,
+    context: object,
     table: string,
     partition: string,
     key: string,
@@ -223,7 +234,7 @@ export async function updateWithIndexes(
     replaced?: Replaced,
 ): Promise<Written> {
     const expiry = expiryOf(table, document)
-    if (!hasIndexes(table)) {
+    if (!transactional(table)) {
         return await c.update(table, partition, key, revision, document, { now, ...expiry })
     }
     const item: Update = {
@@ -238,65 +249,137 @@ export async function updateWithIndexes(
     }
     const { entries, seq } =
         replaced ?? replacedOf(table, partition, key, await existingRow(c, item, now))
-    await c.transact(withinItemLimit(c, [item, ...updateIndexItems(item, entries)], 1), { now })
+    await transactOne(c, context, item, item, updateIndexItems(item, entries), now)
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
 export async function deleteWithIndexes(
     c: Connection,
+    context: object,
     table: string,
     partition: string,
     key: string,
     revision: Revision,
     now: number,
 ): Promise<void> {
-    if (!hasIndexes(table)) {
+    if (!transactional(table)) {
         await c.delete(table, partition, key, revision, { now })
         return
     }
     const item: Delete = { op: 'delete', table, partition, key, revision }
-    await c.transact(withinItemLimit(c, [item, ...(await deleteIndexItems(c, item, now))], 1), {
+    const { document } = await existingRow(c, item, now)
+    await transactOne(
+        c,
+        context,
+        item,
+        { ...item, document },
+        deleteIndexItems(item, document),
         now,
-    })
+    )
 }
 
-export async function expandIndexOperations(
+// The extensions are told only after the transaction resolved, so they hear
+// of a write exactly when it committed.
+async function transactOne(
     c: Connection,
+    context: object,
+    item: TransactionItem,
+    write: ExtendedWrite,
+    indexItems: TransactionItem[],
+    now: number,
+) {
+    const extended = prepareExtensions(context, [write])
+    await c.transact(withinItemLimit(c, [item, ...indexItems, ...extended.items], 1), { now })
+    extended.committed()
+}
+
+export type Expanded = { items: TransactionItem[]; committed: () => void }
+
+// A transaction's buffered items with the index items they need and what the
+// write extensions add, read a bounded number at a time, and the call that
+// tells the extensions once it committed.
+export async function expandWrites(
+    c: Connection,
+    context: object,
     items: TransactionItem[],
     now: number,
-): Promise<TransactionItem[]> {
-    if (items.every(item => !hasIndexes(item.table))) {
-        return items
+): Promise<Expanded> {
+    if (items.every(item => !transactional(item.table))) {
+        return { items, committed: () => undefined }
     }
-    const expanded = await Promise.all(
-        items.map(async (item): Promise<TransactionItem[]> => {
-            if (!hasIndexes(item.table)) {
-                return [item]
-            }
-            switch (item.op) {
-                case 'add':
-                    return [item, ...addIndexItems(item, (await replacedByAdd(c, item)).entries)]
-                case 'update':
-                    return [
-                        item,
-                        ...updateIndexItems(
-                            item,
-                            indexEntriesOf(
-                                item.table,
-                                item.partition,
-                                item.key,
-                                (await existingRow(c, item, now)).document,
-                            ),
-                        ),
-                    ]
-                case 'delete':
-                    return [item, ...(await deleteIndexItems(c, item, now))]
-                default:
-                    return [item]
-            }
-        }),
+    const burst = declaredBound(c, 'requestsInFlightMax', inFlightMax)
+    const expanded: ExpandedItem[] = []
+    for (let start = 0; start < items.length; start += burst) {
+        expanded.push(
+            ...(await Promise.all(
+                items.slice(start, start + burst).map(item => expandItem(c, item, now)),
+            )),
+        )
+    }
+    const extended = prepareExtensions(
+        context,
+        expanded.flatMap(e => (e.write ? [e.write] : [])),
     )
-    return withinItemLimit(c, expanded.flat(), items.length)
+    return {
+        items: withinItemLimit(
+            c,
+            [...expanded.flatMap(e => e.items), ...extended.items],
+            items.length,
+        ),
+        committed: extended.committed,
+    }
+}
+
+type ExpandedItem = { items: TransactionItem[]; write?: ExtendedWrite }
+
+// Only an indexed add or update reads the row it replaces, for the entries
+// to clear; a delete reads it for an extension too, which is handed the
+// document it removes.
+async function expandItem(
+    c: Connection,
+    item: TransactionItem,
+    now: number,
+): Promise<ExpandedItem> {
+    const extended = isExtended(item.table)
+    switch (item.op) {
+        case 'add':
+            return {
+                items: hasIndexes(item.table)
+                    ? [item, ...addIndexItems(item, (await replacedByAdd(c, item)).entries)]
+                    : [item],
+                ...(extended && { write: item }),
+            }
+        case 'update':
+            return {
+                items: hasIndexes(item.table)
+                    ? [
+                          item,
+                          ...updateIndexItems(
+                              item,
+                              indexEntriesOf(
+                                  item.table,
+                                  item.partition,
+                                  item.key,
+                                  (await existingRow(c, item, now)).document,
+                              ),
+                          ),
+                      ]
+                    : [item],
+                ...(extended && { write: item }),
+            }
+        case 'delete': {
+            if (!extended && !hasIndexes(item.table)) {
+                return { items: [item] }
+            }
+            const { document } = await existingRow(c, item, now)
+            return {
+                items: [item, ...deleteIndexItems(item, document)],
+                ...(extended && { write: { ...item, document } }),
+            }
+        }
+        default:
+            return { items: [item] }
+    }
 }
 
 function withinItemLimit(c: Connection, items: TransactionItem[], requestedCount: number) {
@@ -304,7 +387,7 @@ function withinItemLimit(c: Connection, items: TransactionItem[], requestedCount
     if (itemsMax < items.length) {
         throw transactionTooLarge(
             `Transaction cannot contain more than ${String(itemsMax)} operations; ` +
-                `${String(requestedCount)} requested operations expanded to ${String(items.length)} including index maintenance.`,
+                `${String(requestedCount)} requested operations expanded to ${String(items.length)} including index maintenance and write extensions.`,
         )
     }
     return items
@@ -326,13 +409,8 @@ function updateIndexItems(item: Update, oldEntries: IndexEntry[]): TransactionIt
     ]
 }
 
-async function deleteIndexItems(
-    c: Connection,
-    item: Delete,
-    now: number,
-): Promise<TransactionItem[]> {
-    const old = await existingRow(c, item, now)
-    return clearItems(indexEntriesOf(item.table, item.partition, item.key, old.document), [])
+function deleteIndexItems(item: Delete, document: StoredDocument): TransactionItem[] {
+    return clearItems(indexEntriesOf(item.table, item.partition, item.key, document), [])
 }
 
 function putItems(

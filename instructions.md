@@ -263,10 +263,10 @@ The callback gets the `tx` of `withTransaction`, with its rules for buffered wri
 - **A failure is thrown once its window has settled.** A unit fails when its callback throws anything but a conflict of the store, or when its retries are spent. The units behind it that share a document with it are not sent, so a lost fence costs the retries of one unit; every other unit of the window settles, and commits if it can; then the first failure in item order is thrown, and no later window starts.
 - **Results come back in item order**, typed by a third type argument: `transactEach<Schema, Item, Result>`.
 - **`signal`** in the last argument stops the call between windows and ends the wait before a rerun.
-- **One action for the whole call.** On an audited table every unit is written under the invocation's one scope, read when the unit is sent: record the action before the call, never inside the callback.
+- **One action for the whole call.** On an announced or audited table every unit is written under the invocation's one recorder, read when the unit is built, after its callback, and again whenever it is built anew: record the action before the call, never inside the callback.
 - Do not nest `transactEach` or `withTransaction` inside the callback.
 
-A unit is a transaction, so it costs roughly twice a plain write. On a table with indexes or an audit trail every write is a transaction already and nothing changes; for a plain table, weigh it.
+A unit is a transaction, so it costs roughly twice a plain write. On a table with indexes, or one a write extension applies to (announced or audited), every write is a transaction already and nothing changes; for a plain table, weigh it.
 
 ## Secondary Indexes
 
@@ -409,7 +409,7 @@ Rules and properties:
 
 ## Driver Decoration
 
-Extension packages (auditing, tracing, metrics) can wrap the active driver with `decorateDriver` from `@movogo-io/docs/driver`:
+Extension packages (tracing, metrics, fault injection in tests) can wrap the active driver with `decorateDriver` from `@movogo-io/docs/driver`:
 
 ```ts
 import { decorateDriver, type Driver } from '@movogo-io/docs/driver';
@@ -422,6 +422,25 @@ Decorators are applied lazily whenever the driver is used, regardless of the ord
 A decorator must forward the trailing read options of `get`, `getMany` and `getPartition` to the wrapped connection; one that drops them makes every read beneath it silently lose the consistency it asked for.
 
 A connection declares what its driver enforces: `requestsInFlightMax`, how many requests it holds in flight, and `transactionItemsMax`, how many operations one transaction takes. The store sizes the windows of `transactEach` from the first and refuses an oversized transaction early by the second; for a connection that declares neither it keeps 16 and 100 of its own. A declared bound that is not a positive integer is refused, not stepped by. A decorator forwards both: one that lists the members it forwards and leaves them out hides them, and the store falls back. `declaredLimits(context)` answers what the connection for a context declares, for an infrastructure package that sizes a transaction by hand.
+
+### Extending writes
+
+A package that must add to every write of some tables, as `@movogo-io/announce` does, registers a write extension with `extendWrites` from `@movogo-io/docs/driver` rather than decorating the driver. A decorator has to forward every member of the connection and repeat what the store does for a write; an extension is handed the write as the store is about to send it:
+
+```ts
+import { extendWrites, type WriteExtension } from '@movogo-io/docs/driver';
+
+const remove = extendWrites({
+    applies: table => registered.has(table),
+    prepare: (context, writes) => ({ items: itemsFor(writes), committed: () => record(context, writes) }),
+});
+```
+
+- **A table an extension applies to is written in a transaction**, as an indexed table is: a single add or update reads the row it replaces first, for the `seq` it answers, unless the caller already read it (`getOrAdd`, `addOrUpdate`, `converge`); a delete reads the row it deletes, plainly and consistently only when the plain read is stale, and conflicts before anything is sent when the row is absent, expired or at another revision. A buffered add or update reads nothing more than the table's indexes need. Buffered reads go out as many at a time as the connection declares in `requestsInFlightMax`.
+- **`prepare(context, writes)` runs once per transaction**, with the `context` the accessor was opened on and every add, update and delete of the tables the extension applies to, revisions minted; a delete carries the `document` it removes. Index items, `put`, `check` and `clear` are never handed over. It is synchronous, so every read stays the store's, and **side-effect free**: it may run for a transaction that is never sent, a conflict retried, a `transactEach` unit built anew or never sent.
+- **The items it answers join the write's transaction** and count toward `transactionItemsMax` with the index items, refused as `isTransactionTooLarge`. Two extensions must not answer items for one row.
+- **`committed` is called once, after the transaction committed**, never for one the store refused, retried or discarded; it must not throw, since the write is already done. Extensions are prepared and told in registration order; registering one twice throws, and `extendWrites` returns the function that removes it.
+- **Only writes through the store are extended.** A write made on a raw connection, through a decorator or a driver held directly, bypasses every extension, and a decorator sees an extended table's writes as one `transact` that already carries the extension's items. A decorator wraps the methods it changes on the connection it is handed, never spreads it: a driver's connection may be a class instance, whose methods a spread leaves behind.
 
 The driver, its decorators and the index and expiry registries are module state, so one process must hold one copy of this package: the first copy loaded claims `globalThis[Symbol.for('@movogo-io/docs')]`, and a second copy refuses to load with an error naming both versions and paths, which turns a nested duplicate under a mis-pinned package into a failing test run instead of writes that silently bypass auditing and indexes.
 
