@@ -1,5 +1,6 @@
 // eslint-disable-next-line unicorn/no-barrel-files
 export {
+    declaredLimits,
     decorateDriver,
     setDriver,
     type Connection,

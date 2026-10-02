@@ -868,7 +868,7 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
 ): Promise<T> {
     return await withConnection(context, async (session, c) => {
         return await retryConflict(async () => {
-            const buffer = new TransactionBuffer()
+            const buffer = new TransactionBuffer(c.transactionItemsMax)
             const result = await fn(transactionTables<Schema>(session, buffer))
             const now = session.nowSeconds()
             const items = await expandIndexOperations(c, buffer.seal(), now)
@@ -899,11 +899,12 @@ export async function transactEach<Schema = GenericSchema, Item = unknown, T = v
 ): Promise<T[]> {
     return await withConnection(context, async (session, c) => {
         const results: T[] = []
-        for (let start = 0; start < items.length; start += inFlightMax) {
+        const window = c.requestsInFlightMax ?? inFlightMax
+        for (let start = 0; start < items.length; start += window) {
             options?.signal?.throwIfAborted()
             const build = (item: Item) => buildUnit(session, c, fn, item)
             results.push(
-                ...(await settleWindow(c, items.slice(start, start + inFlightMax), build, options)),
+                ...(await settleWindow(c, items.slice(start, start + window), build, options)),
             )
         }
         return results
@@ -943,7 +944,7 @@ async function buildUnit<Schema, Item, T>(
     fn: (tx: TransactionTables<Schema>, item: Item) => Promise<T>,
     item: Item,
 ): Promise<Unit<T>> {
-    const buffer = new TransactionBuffer()
+    const buffer = new TransactionBuffer(c.transactionItemsMax)
     try {
         const result = await fn(transactionTables<Schema>(session, buffer), item)
         const now = session.nowSeconds()

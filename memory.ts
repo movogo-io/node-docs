@@ -56,6 +56,7 @@ type Row = {
 }
 
 class MemoryConnection {
+    readonly transactionItemsMax = maxTransactionItems
     readonly #documents: MemoryDocuments | DelayedDocuments | LaggingDocuments
     #closed = false
 

@@ -261,6 +261,19 @@ describe('transactEach', () => {
         )
     })
 
+    it('should size its windows from the bound the connection declares', async () => {
+        const sent = spyOnTransactions({ requestsInFlightMax: 4 })
+        await using context = new TestContext()
+        const keys = Array.from({ length: 10 }, (_, i) => `r${String(i)}`)
+
+        await transactEach<Schema, string>(context, keys, async (tx, key) => {
+            await tx.Rentals.partition('s1').add(key, { name: key, count: 1 })
+        })
+
+        assert.strictEqual(sent.inFlightPeak(), 4)
+        assert.strictEqual((await rentalsOf(context)).length, 10)
+    })
+
     it('should start no window once the signal is aborted', async () => {
         await using context = new TestContext()
         const keys = Array.from({ length: 20 }, (_, i) => `r${String(i).padStart(2, '0')}`)
@@ -333,7 +346,7 @@ async function rentalsOf(context: TestContext) {
 }
 
 // Holds every transaction for a moment, so the ones in flight together overlap.
-function spyOnTransactions() {
+function spyOnTransactions(declared?: { requestsInFlightMax: number }) {
     const inner = new PersistentMemoryDriver()
     const sent: string[][] = []
     let inFlight = 0
@@ -341,7 +354,7 @@ function spyOnTransactions() {
     setDriver({
         connect: async () => {
             const c = await inner.connect()
-            return spyConnection(c, async (items, options) => {
+            const spy = spyConnection(c, async (items, options) => {
                 sent.push(items.map(item => item.key))
                 inFlight += 1
                 inFlightPeak = Math.max(inFlightPeak, inFlight)
@@ -352,6 +365,7 @@ function spyOnTransactions() {
                     inFlight -= 1
                 }
             })
+            return { ...spy, ...declared }
         },
     })
     return { keys: () => sent, inFlightPeak: () => inFlightPeak }

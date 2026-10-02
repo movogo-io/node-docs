@@ -98,7 +98,8 @@ function refKey(ref: { partition: string; key: string }) {
 // A driver pays one round trip per operation and, on a cold connection, one
 // TLS connection per operation in flight — an unbounded burst over a
 // tenant-sized list has failed a production request outright with
-// `getaddrinfo EBUSY`. 16 in flight keeps the burst harmless.
+// `getaddrinfo EBUSY`. 16 in flight keeps the burst harmless under a driver
+// that declares no bound of its own.
 export const inFlightMax = 16
 
 async function getManyRaw(
@@ -111,9 +112,10 @@ async function getManyRaw(
         return await c.getMany(table, refs, options)
     }
     const rows: Awaited<ReturnType<Connection['get']>>[] = []
-    for (let start = 0; start < refs.length; start += inFlightMax) {
+    const inFlight = c.requestsInFlightMax ?? inFlightMax
+    for (let start = 0; start < refs.length; start += inFlight) {
         const chunk = await Promise.all(
-            refs.slice(start, start + inFlightMax).map(ref => getRaw(c, table, ref, options)),
+            refs.slice(start, start + inFlight).map(ref => getRaw(c, table, ref, options)),
         )
         rows.push(...chunk.filter(row => row !== undefined))
     }

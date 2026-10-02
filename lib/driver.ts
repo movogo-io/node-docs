@@ -90,6 +90,13 @@ export type TransactionItem =
 export type Written = { revision: Revision; seq: number; updatedAt: string }
 
 export type Connection = {
+    // What the driver enforces itself, for the store to size its work from
+    // instead of assuming: how many requests it holds in flight, a request
+    // past that waiting its turn, and how many operations one transaction
+    // takes. A connection that declares no bound is taken to have none, and
+    // the store keeps its own. A decorator forwards both, or hides them.
+    readonly requestsInFlightMax?: number
+    readonly transactionItemsMax?: number
     close: () => Promise<void>
     add: (
         table: string,
@@ -207,6 +214,24 @@ export function decorateDriver(decorator: (driver: Driver) => Driver) {
         }
         state.decorators.splice(index, 1)
         state.decorated = undefined
+    }
+}
+
+// What the connection the store would use for this context declares; nothing
+// for a bound it does not declare, or one a decorator hides.
+export async function declaredLimits(context: Context) {
+    const c = await getDriver().connect(context)
+    try {
+        return {
+            ...(c.requestsInFlightMax !== undefined && {
+                requestsInFlightMax: c.requestsInFlightMax,
+            }),
+            ...(c.transactionItemsMax !== undefined && {
+                transactionItemsMax: c.transactionItemsMax,
+            }),
+        }
+    } finally {
+        await c.close()
     }
 }
 

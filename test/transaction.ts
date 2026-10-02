@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import { setDriver, type Connection, type TransactionItem } from '../driver.js'
 import { DelayedPersistentMemoryDriver, PersistentMemoryDriver } from '../memory.js'
-import { isConflict, isNotFound, tables, withTransaction } from '../partitioned.js'
+import {
+    isConflict,
+    isNotFound,
+    isTransactionTooLarge,
+    tables,
+    withTransaction,
+} from '../partitioned.js'
 
 type Schema = {
     Rentals: {
@@ -148,6 +154,32 @@ describe('transactions', () => {
                 }
             }),
             /more than 100/u,
+        )
+
+        await assert.rejects(tables<Schema>(context).Rentals.partition('s1').get('r0'), isNotFound)
+    })
+
+    it('should reject more operations than the connection declares it takes', async () => {
+        const inner = new PersistentMemoryDriver()
+        setDriver({
+            connect: async () => {
+                const c = await inner.connect()
+                return {
+                    ...spyConnection(c, (items, options) => c.transact(items, options)),
+                    transactionItemsMax: 3,
+                }
+            },
+        })
+        await using context = new TestContext()
+
+        await assert.rejects(
+            withTransaction<Schema>(context, async tx => {
+                const rentals = tx.Rentals.partition('s1')
+                for (let i = 0; i !== 4; ++i) {
+                    await rentals.add(`r${String(i)}`, { name: 'a', count: i })
+                }
+            }),
+            (e: unknown) => isTransactionTooLarge(e) && String(e).includes('more than 3'),
         )
 
         await assert.rejects(tables<Schema>(context).Rentals.partition('s1').get('r0'), isNotFound)

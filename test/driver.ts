@@ -2,7 +2,13 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { decorateDriver, setDriver, type Connection, type Driver } from '../driver.js'
+import {
+    declaredLimits,
+    decorateDriver,
+    setDriver,
+    type Connection,
+    type Driver,
+} from '../driver.js'
 import { MemoryDriver } from '../memory.js'
 import { tables } from '../partitioned.js'
 
@@ -40,6 +46,14 @@ describe('driver decoration', () => {
         await using db = tables<Schema>({})
         await db.DecoratedDocs.partition('p1').add('k1', { n: 1 })
         assert.deepStrictEqual(seen, ['late add DecoratedDocs'])
+    })
+
+    it('answers the limits the connection declares, and none a decorator hides', async () => {
+        setDriver(new MemoryDriver())
+        assert.deepStrictEqual(await declaredLimits({}), { transactionItemsMax: 100 })
+
+        removers.push(decorateDriver(recording('hiding', seen)))
+        assert.deepStrictEqual(await declaredLimits({}), {})
     })
 
     it('wraps later decorators around earlier ones', async () => {

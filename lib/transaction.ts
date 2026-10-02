@@ -11,7 +11,12 @@ export const maxTransactionBytes = 4 * 1024 * 1024
 export class TransactionBuffer {
     readonly #items: TransactionItem[] = []
     readonly #touched = new Set<string>()
+    readonly #itemsMax
     #sealed = false
+
+    constructor(itemsMax = maxTransactionItems) {
+        this.#itemsMax = itemsMax
+    }
 
     async add(table: string, partition: string, key: string, document: StoredDocument) {
         const expiry = expiryOf(table, document)
@@ -66,9 +71,9 @@ export class TransactionBuffer {
                     `Transaction already contains an operation on '${item.key}' in partition '${item.partition}' of table '${item.table}'.`,
                 )
             }
-            if (this.#items.length === maxTransactionItems) {
+            if (this.#items.length === this.#itemsMax) {
                 throw transactionTooLarge(
-                    `Transaction cannot contain more than ${String(maxTransactionItems)} operations.`,
+                    `Transaction cannot contain more than ${String(this.#itemsMax)} operations.`,
                 )
             }
             this.#touched.add(id)

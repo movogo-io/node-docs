@@ -146,6 +146,7 @@ export async function reindexRow(
     }
     await c.transact(
         withinItemLimit(
+            c,
             [check, ...putItems(entries, row.document, row.revision, row.expiresAt)],
             1,
         ),
@@ -201,7 +202,7 @@ export async function addWithIndexes(
         ...expiry,
     }
     const { entries, seq } = replaced ?? (await replacedByAdd(c, item))
-    await c.transact(withinItemLimit([item, ...addIndexItems(item, entries)], 1), { now })
+    await c.transact(withinItemLimit(c, [item, ...addIndexItems(item, entries)], 1), { now })
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -231,7 +232,7 @@ export async function updateWithIndexes(
     }
     const { entries, seq } =
         replaced ?? replacedOf(table, partition, key, await existingRow(c, item, now))
-    await c.transact(withinItemLimit([item, ...updateIndexItems(item, entries)], 1), { now })
+    await c.transact(withinItemLimit(c, [item, ...updateIndexItems(item, entries)], 1), { now })
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -248,7 +249,7 @@ export async function deleteWithIndexes(
         return
     }
     const item: Delete = { op: 'delete', table, partition, key, revision }
-    await c.transact(withinItemLimit([item, ...(await deleteIndexItems(c, item, now))], 1), {
+    await c.transact(withinItemLimit(c, [item, ...(await deleteIndexItems(c, item, now))], 1), {
         now,
     })
 }
@@ -289,13 +290,14 @@ export async function expandIndexOperations(
             }
         }),
     )
-    return withinItemLimit(expanded.flat(), items.length)
+    return withinItemLimit(c, expanded.flat(), items.length)
 }
 
-function withinItemLimit(items: TransactionItem[], requestedCount: number) {
-    if (maxTransactionItems < items.length) {
+function withinItemLimit(c: Connection, items: TransactionItem[], requestedCount: number) {
+    const itemsMax = c.transactionItemsMax ?? maxTransactionItems
+    if (itemsMax < items.length) {
         throw transactionTooLarge(
-            `Transaction cannot contain more than ${String(maxTransactionItems)} operations; ` +
+            `Transaction cannot contain more than ${String(itemsMax)} operations; ` +
                 `${String(requestedCount)} requested operations expanded to ${String(items.length)} including index maintenance.`,
         )
     }
