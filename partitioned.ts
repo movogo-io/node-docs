@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import { setTimeout } from 'node:timers/promises'
 import { isConflict } from './lib/errors.js'
-import { findEachUnexpired, findUnexpired, getRow, getUnexpired, unexpired } from './lib/expiry.js'
+import {
+    findEachUnexpired,
+    findUnexpired,
+    getRow,
+    getUnexpired,
+    inFlightMax,
+    unexpired,
+} from './lib/expiry.js'
 import {
     addWithIndexes,
     deleteWithIndexes,
@@ -9,7 +16,7 @@ import {
     replacedOf,
     updateWithIndexes,
 } from './lib/indexes.js'
-import type { ReadOptions } from './lib/driver.js'
+import type { Connection, ReadOptions, TransactionItem } from './lib/driver.js'
 import { openSession, type Session } from './lib/session.js'
 import { TransactionBuffer } from './lib/transaction.js'
 import type { KeyRange, Revision, StoredDocument } from './schema.js'
@@ -859,21 +866,10 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
     fn: (tx: TransactionTables<Schema>) => Promise<T>,
     options?: RetryOptions,
 ): Promise<T> {
-    const session = openSession(context)
-    const closer = async () => {
-        const c = await session.connection
-        await c.close()
-    }
-    const registered = context.on?.('free', closer) ?? false
-    try {
-        const c = await session.connection
+    return await withConnection(context, async (session, c) => {
         return await retryConflict(async () => {
             const buffer = new TransactionBuffer()
-            const tx = new Proxy(
-                transactionTablesBase(session, buffer),
-                transactionTablesProxy,
-            ) as unknown as TransactionTables<Schema>
-            const result = await fn(tx)
+            const result = await fn(transactionTables<Schema>(session, buffer))
             const now = session.nowSeconds()
             const items = await expandIndexOperations(c, buffer.seal(), now)
             if (items.length !== 0) {
@@ -881,11 +877,180 @@ export async function withTransaction<Schema = GenericSchema, T = void>(
             }
             return result
         }, options)
+    })
+}
+
+export type EachOptions = {
+    retries?: number
+    delay?: number
+    signal?: AbortSignal
+}
+
+// One unit of work per item: what `fn` buffers for an item commits atomically
+// and independently of every other item's unit. Items are taken a window at a
+// time; the callbacks of a window run together, so its units read before any
+// of them commits. Units that touch a common document, by a write or a check,
+// are sent one at a time in item order, the others together.
+export async function transactEach<Schema = GenericSchema, Item = unknown, T = void>(
+    context: Context,
+    items: readonly Item[],
+    fn: (tx: TransactionTables<Schema>, item: Item) => Promise<T>,
+    options?: EachOptions,
+): Promise<T[]> {
+    return await withConnection(context, async (session, c) => {
+        const results: T[] = []
+        for (let start = 0; start < items.length; start += inFlightMax) {
+            options?.signal?.throwIfAborted()
+            const build = (item: Item) => buildUnit(session, c, fn, item)
+            results.push(
+                ...(await settleWindow(c, items.slice(start, start + inFlightMax), build, options)),
+            )
+        }
+        return results
+    })
+}
+
+async function withConnection<T>(
+    context: Context,
+    work: (session: Session, c: Connection) => Promise<T>,
+): Promise<T> {
+    const session = openSession(context)
+    const closer = async () => {
+        const c = await session.connection
+        await c.close()
+    }
+    const registered = context.on?.('free', closer) ?? false
+    try {
+        return await work(session, await session.connection)
     } finally {
         if (!registered) {
             await closer()
         }
     }
+}
+
+// A unit as its callback left it: the transaction it sends, or what it threw,
+// with whatever it had buffered by then.
+type Unit<T> =
+    | { items: TransactionItem[]; now: number; result: T }
+    | { items: TransactionItem[]; error: unknown }
+
+type Outcome<T> = { result: T } | { error: unknown }
+
+async function buildUnit<Schema, Item, T>(
+    session: Session,
+    c: Connection,
+    fn: (tx: TransactionTables<Schema>, item: Item) => Promise<T>,
+    item: Item,
+): Promise<Unit<T>> {
+    const buffer = new TransactionBuffer()
+    try {
+        const result = await fn(transactionTables<Schema>(session, buffer), item)
+        const now = session.nowSeconds()
+        return { items: await expandIndexOperations(c, buffer.seal(), now), now, result }
+    } catch (error) {
+        return { items: buffer.seal(), error }
+    }
+}
+
+// Every unit of the window settles before its first failure, in item order,
+// is thrown: a unit still in flight when the caller throws would commit behind
+// its back.
+async function settleWindow<Item, T>(
+    c: Connection,
+    items: readonly Item[],
+    build: (item: Item) => Promise<Unit<T>>,
+    options: EachOptions | undefined,
+): Promise<T[]> {
+    const built = await Promise.all(
+        items.map(async (item, index) => ({ index, item, unit: await build(item) })),
+    )
+    const outcomes = new Map<number, Outcome<T>>()
+    await Promise.all(
+        chainsOf(built, ({ unit }) => unit.items.map(documentOf)).map(async chain => {
+            for (const { index, item, unit } of chain) {
+                const outcome = await settleUnit(c, unit, () => build(item), options)
+                outcomes.set(index, outcome)
+                // The units behind it share a document with it: sent, they
+                // would repeat its failure or apply out of item order.
+                if ('error' in outcome) {
+                    return
+                }
+            }
+        }),
+    )
+    const settled = built.map(({ index }) => outcomes.get(index))
+    const failed = settled.find(outcome => outcome !== undefined && 'error' in outcome)
+    if (failed) {
+        throw failed.error
+    }
+    return settled.flatMap(outcome => (outcome && 'result' in outcome ? [outcome.result] : []))
+}
+
+// A unit that loses a race is built again, callback included; the units
+// waiting behind it keep what they buffered.
+async function settleUnit<T>(
+    c: Connection,
+    first: Unit<T>,
+    rebuild: () => Promise<Unit<T>>,
+    options: EachOptions | undefined,
+): Promise<Outcome<T>> {
+    let unit = first
+    for (let remaining = options?.retries ?? 3; ; --remaining) {
+        try {
+            if ('error' in unit) {
+                throw unit.error
+            }
+            if (unit.items.length !== 0) {
+                await c.transact(unit.items, { now: unit.now })
+            }
+            return { result: unit.result }
+        } catch (error) {
+            if (!remaining || !isConflict(error)) {
+                return { error }
+            }
+        }
+        try {
+            await conflictDelay(options)
+        } catch (error) {
+            return { error }
+        }
+        unit = await rebuild()
+    }
+}
+
+// The members grouped by the documents they touch, each group in the order
+// given: two members are in one chain when a document links them, directly or
+// through other members.
+function chainsOf<Member>(
+    members: readonly Member[],
+    documentsOf: (member: Member) => string[],
+): Member[][] {
+    type Chain = { positions: number[]; documents: string[] }
+    const chainOfDocument = new Map<string, Chain>()
+    const chains = new Set<Chain>()
+    for (const [position, member] of members.entries()) {
+        const documents = documentsOf(member)
+        const joined = [...new Set(documents.flatMap(d => chainOfDocument.get(d) ?? []))]
+        const chain = {
+            positions: [...joined.flatMap(other => other.positions), position],
+            documents: [...joined.flatMap(other => other.documents), ...documents],
+        }
+        for (const other of joined) {
+            chains.delete(other)
+        }
+        chains.add(chain)
+        for (const document of chain.documents) {
+            chainOfDocument.set(document, chain)
+        }
+    }
+    return [...chains].map(chain =>
+        chain.positions.toSorted((a, b) => a - b).flatMap(position => members[position] ?? []),
+    )
+}
+
+function documentOf(item: TransactionItem) {
+    return JSON.stringify([item.table, item.partition, item.key])
 }
 
 const bufferEntry = Symbol()
@@ -902,6 +1067,13 @@ const transactionTablesProxy = facadeProxy(
         return new Proxy(transactionTableBase(target, table), transactionTableProxy)
     },
 )
+
+function transactionTables<Schema>(session: Session, buffer: TransactionBuffer) {
+    return new Proxy(
+        transactionTablesBase(session, buffer),
+        transactionTablesProxy,
+    ) as unknown as TransactionTables<Schema>
+}
 
 function transactionTableBase(db: ReturnType<typeof transactionTablesBase>, table: string) {
     return {
@@ -1316,9 +1488,7 @@ export async function retryConflict<T>(fn: () => Promise<T>, options?: RetryOpti
                 throw e
             }
             if (isConflict(e)) {
-                await setTimeout((options?.delay ?? 250) * (Math.random() + 0.5), undefined, {
-                    signal: options?.signal,
-                })
+                await conflictDelay(options)
                 continue
             }
             throw e
@@ -1326,6 +1496,12 @@ export async function retryConflict<T>(fn: () => Promise<T>, options?: RetryOpti
     }
 }
 
-export { isConflict, isNotFound } from './lib/errors.js'
+async function conflictDelay(options: { delay?: number; signal?: AbortSignal } | undefined) {
+    await setTimeout((options?.delay ?? 250) * (Math.random() + 0.5), undefined, {
+        signal: options?.signal,
+    })
+}
+
+export { isConflict, isNotFound, isTransactionTooLarge } from './lib/errors.js'
 export { compositeKey, compositeRange } from './lib/keys.js'
 export type { ReadOptions } from './lib/driver.js'

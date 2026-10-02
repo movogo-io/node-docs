@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
 import type { ReadOptions, TransactionItem } from './lib/driver.js'
-import { conflict, notFound } from './lib/errors.js'
+import { conflict, notFound, transactionTooLarge } from './lib/errors.js'
 import { isoOf } from './lib/expiry.js'
 import { maxTransactionBytes, maxTransactionItems } from './lib/transaction.js'
 import type { KeyRange } from './schema.js'
@@ -629,13 +629,13 @@ function throwIfAnyDocumentRepeats(items: TransactionItem[]) {
 // added theirs, so this is where a test sees the transaction production sends.
 function throwIfOverLimits(items: TransactionItem[]) {
     if (maxTransactionItems < items.length) {
-        throw new Error(
+        throw transactionTooLarge(
             `Transaction contains ${String(items.length)} operations on ${tablesOf(items)}; at most ${String(maxTransactionItems)} are allowed.`,
         )
     }
     const bytes = items.reduce((sum, item) => sum + itemBytes(item), 0)
     if (maxTransactionBytes < bytes) {
-        throw new Error(
+        throw transactionTooLarge(
             `Transaction of ${String(items.length)} operations on ${tablesOf(items)} is about ${String(bytes)} bytes; at most ${String(maxTransactionBytes)} are allowed.`,
         )
     }

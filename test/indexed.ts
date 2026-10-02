@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { decorateDriver, setDriver, type Driver, type TransactionItem } from '../driver.js'
 import { docs } from '../indexed.js'
 import { DelayedPersistentMemoryDriver } from '../memory.js'
-import { isConflict, withTransaction } from '../partitioned.js'
+import { isConflict, transactEach, withTransaction } from '../partitioned.js'
 
 type Rental = {
     name: string
@@ -232,6 +232,29 @@ describe('indexes', () => {
         })
 
         assert.strictEqual(await byUnit(context).partition('u1').first('r1'), undefined)
+        const keys = await Array.fromAsync(
+            byUnit(context).partition('u2').getRange({ withPrefix: '' }),
+            row => row.key,
+        )
+        assert.deepStrictEqual(keys, ['r1', 'r2'])
+    })
+
+    it('should maintain the indexes of every unit of a bulk write', async () => {
+        await using context = new TestContext()
+        const rentals = schema.tables(context).IndexedRentals
+        await rentals.partition('s1').add('r1', aRental({ unitId: 'u1' }))
+        await rentals.partition('s1').add('r2', aRental({ unitId: 'u1' }))
+
+        await transactEach<Schema, string>(context, ['r1', 'r2'], async (tx, key) => {
+            const row = await tx.IndexedRentals.partition('s1').get(key)
+            await tx.IndexedRentals.partition('s1').update(key, row.revision, {
+                ...row.document,
+                unitId: 'u2',
+            })
+        })
+
+        assert.strictEqual(await byUnit(context).partition('u1').first('r1'), undefined)
+        assert.strictEqual(await byUnit(context).partition('u1').first('r2'), undefined)
         const keys = await Array.fromAsync(
             byUnit(context).partition('u2').getRange({ withPrefix: '' }),
             row => row.key,

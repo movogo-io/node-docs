@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Revision, StoredDocument } from '../schema.js'
 import type { TransactionItem } from './driver.js'
+import { transactionTooLarge } from './errors.js'
 import { expiryOf } from './expiry.js'
 
 export const maxTransactionItems = 100
@@ -66,7 +67,7 @@ export class TransactionBuffer {
                 )
             }
             if (this.#items.length === maxTransactionItems) {
-                throw new Error(
+                throw transactionTooLarge(
                     `Transaction cannot contain more than ${String(maxTransactionItems)} operations.`,
                 )
             }

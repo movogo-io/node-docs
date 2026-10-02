@@ -152,7 +152,7 @@ async function getUserProfile(context: object, userId: string) {
 }
 ```
 
-`isNotFound` and `isConflict` identify the store's errors where a `try` is still needed. A conflict is not handled with a `try`, though: it is retried.
+`isNotFound` and `isConflict` identify the store's errors where a `try` is still needed, and `isTransactionTooLarge` the refusal of a transaction no backend could commit, a defect of the handler that carries no status. A conflict is not handled with a `try`, though: it is retried.
 
 Not-found and conflict errors carry `statusCode` 404 and 409, so one that escapes a @riddance/service handler — typically a conflict once the retries of a helper or `withTransaction` are spent — is answered 404 or 409, not 500. `isNotFound` and `isConflict` identify errors raised by the store, not any 404 or 409: an error carrying only `statusCode`, such as one from `@riddance/service`, does not match, so a domain conflict thrown inside a retrying helper is not retried and not mistaken for contention.
 
@@ -228,13 +228,45 @@ The `tx` argument mirrors the `tables` surface with these rules:
 - **Reads return committed state.** `get`, `getDocument`, `find`, `findEach`, `getAll`, and `getRange` pass through to storage — you cannot read your own buffered writes. `getPartitions` is not available inside a transaction. They take the same trailing `{ consistent: true }` as outside a transaction. The transaction's own conditions already catch a stale revision, which only costs a retry; the option is for a row the callback skips as absent or unchanged, which no condition checks.
 - **The whole callback retries on conflict** (default 3 retries with jittered delay; pass `{ retries: 0 }` as the third argument to disable). The callback must therefore be safe to re-run: no side effects other than the buffered writes.
 - **At most 100 operations, and at most one operation per document.** Two operations on the same document — including delete-then-add — reject immediately and are not retried. Index maintenance and audit entries count toward the 100.
-- **At most 4 MB in all.** DynamoDB refuses a larger transaction, and refuses it again on every retry, so work queued behind it never finishes. Every index entry and every audit entry is a copy of the document, so a batch of large documents reaches 4 MB long before 100 operations. The memory drivers refuse both limits, so a test sees what production would; a service that packs writes into batches fills each one up to both, with the exported `maxTransactionItems` and `maxTransactionBytes` from `@movogo-io/docs/driver`, instead of a fixed count.
+- **At most 4 MB in all.** DynamoDB refuses a larger transaction, and refuses it again on every retry, so work queued behind it never finishes. Every index entry and every audit entry is a copy of the document, so a batch of large documents reaches 4 MB long before 100 operations. The memory drivers refuse both limits, so a test sees what production would, with an error `isTransactionTooLarge` recognizes. A list of independent writes is not one transaction and is never packed into batches by hand: it is one `transactEach` (see *Bulk writes*).
 - **`check(key, revision)`** asserts a document still has the given revision without writing to it, e.g. "the parent still looks like it did when I read it" while writing a child.
 - The retry helpers (`getOrAdd`, `addOrUpdate`, `converge`) are not available inside a transaction; the whole-transaction retry replaces them.
 - If the callback throws, nothing is written.
 - Do not nest `withTransaction` calls: the inner transaction commits independently, and outer retries would re-run it.
 
 Transactional writes cost roughly twice as much as plain writes, so don't reach for `withTransaction` when writing a single document.
+
+## Bulk writes
+
+`transactEach` applies one unit of work per item of a list: what the callback buffers for an item commits atomically, and independently of every other item's unit. Use it wherever a handler does the same read, decide and write for many documents and nothing needs to be atomic across them: retiring the units of an equipment, purging the children of a deleted parent, applying a membership to each member. The store decides what goes out together; a service names no batch size and no bound on what is in flight, and never loops over `withTransaction` or wraps writes in a `Promise.all` of its own.
+
+```ts
+import { transactEach } from "@movogo-io/docs";
+
+await transactEach<Schema, string>(context, unitIds, async (tx, unitId) => {
+    const units = tx.FleetUnits.partition(supplierId);
+    const row = await units.find(unitId, { consistent: true });
+    if (row === undefined || row.document.status === "retired") {
+        return;
+    }
+    await units.update(unitId, row.revision, { ...row.document, status: "retired" });
+});
+```
+
+The callback gets the `tx` of `withTransaction`, with its rules for buffered writes and reads, and these:
+
+- **Each unit is atomic; the call is not.** A crash or a failure part-way leaves some units committed and others not. Write the callback so that running the whole call again converges: read the document, and write nothing when it already is as asked.
+- **A unit that buffers nothing sends nothing.**
+- **Units that touch a common document, by a write or a `check`, are sent one at a time in the order of the items; the others go out together.** A `check` of one row from every unit, the fence of a set being replaced, is therefore safe, and two units that write the same document apply in item order.
+- **A unit that loses a race runs again alone,** callback included, with the retries and delay of `retryConflict` (`{ retries, delay }` as the last argument). The units waiting behind it are sent as they first buffered.
+- **Items are taken a window at a time.** The callbacks of a window run together, so its units read before any of them commits.
+- **A failure is thrown once its window has settled.** A unit fails when its callback throws anything but a conflict of the store, or when its retries are spent. The units behind it that share a document with it are not sent, so a lost fence costs the retries of one unit; every other unit of the window settles, and commits if it can; then the first failure in item order is thrown, and no later window starts.
+- **Results come back in item order**, typed by a third type argument: `transactEach<Schema, Item, Result>`.
+- **`signal`** in the last argument stops the call between windows and ends the wait before a rerun.
+- **One action for the whole call.** On an audited table every unit is written under the invocation's one scope, read when the unit is sent: record the action before the call, never inside the callback.
+- Do not nest `transactEach` or `withTransaction` inside the callback.
+
+A unit is a transaction, so it costs roughly twice a plain write. On a table with indexes or an audit trail every write is a transaction already and nothing changes; for a plain table, weigh it.
 
 ## Secondary Indexes
 
