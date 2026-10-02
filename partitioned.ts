@@ -936,7 +936,7 @@ type Unit<T> =
     | { items: TransactionItem[]; now: number; result: T }
     | { items: TransactionItem[]; error: unknown }
 
-type Outcome<T> = { result: T } | { error: unknown }
+type Outcome<T> = { result: T; items: TransactionItem[] } | { error: unknown }
 
 async function buildUnit<Schema, Item, T>(
     session: Session,
@@ -969,13 +969,24 @@ async function settleWindow<Item, T>(
     const outcomes = new Map<number, Outcome<T>>()
     await Promise.all(
         chainsOf(built, ({ unit }) => unit.items.map(documentOf)).map(async chain => {
+            const written = new Set<string>()
             for (const { index, item, unit } of chain) {
-                const outcome = await settleUnit(c, unit, () => build(item), options)
+                // It read what an earlier unit has since overwritten: sent as
+                // buffered, it could only lose to that unit.
+                const fresh = unit.items.some(i => written.has(documentOf(i)))
+                    ? await build(item)
+                    : unit
+                const outcome = await settleUnit(c, fresh, () => build(item), options)
                 outcomes.set(index, outcome)
                 // The units behind it share a document with it: sent, they
                 // would repeat its failure or apply out of item order.
                 if ('error' in outcome) {
                     return
+                }
+                for (const committed of outcome.items) {
+                    if (committed.op !== 'check') {
+                        written.add(documentOf(committed))
+                    }
                 }
             }
         }),
@@ -988,8 +999,7 @@ async function settleWindow<Item, T>(
     return settled.flatMap(outcome => (outcome && 'result' in outcome ? [outcome.result] : []))
 }
 
-// A unit that loses a race is built again, callback included; the units
-// waiting behind it keep what they buffered.
+// A unit that loses a race is built again, callback included.
 async function settleUnit<T>(
     c: Connection,
     first: Unit<T>,
@@ -1005,7 +1015,7 @@ async function settleUnit<T>(
             if (unit.items.length !== 0) {
                 await c.transact(unit.items, { now: unit.now })
             }
-            return { result: unit.result }
+            return { result: unit.result, items: unit.items }
         } catch (error) {
             if (!remaining || !isConflict(error)) {
                 return { error }

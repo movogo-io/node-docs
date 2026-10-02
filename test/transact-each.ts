@@ -91,11 +91,15 @@ describe('transactEach', () => {
         await using context = new TestContext()
         const fence = await tables<Schema>(context).Fences.partition('s1').add('f1', { name: 'f' })
 
+        const runs: string[] = []
+
         await transactEach<Schema, string>(context, ['r1', 'r2', 'r3'], async (tx, key) => {
+            runs.push(key)
             await tx.Fences.partition('s1').check('f1', fence)
             await tx.Rentals.partition('s1').add(key, { name: key, count: 1 })
         })
 
+        assert.deepStrictEqual(runs, ['r1', 'r2', 'r3'])
         assert.strictEqual(sent.inFlightPeak(), 1)
         assert.deepStrictEqual(sent.keys(), [
             ['f1', 'r1'],
@@ -107,20 +111,23 @@ describe('transactEach', () => {
     it('should apply two units that write one document in item order', async () => {
         await using context = new TestContext()
         await tables<Schema>(context).Rentals.partition('s1').add('r1', { name: '', count: 0 })
+        const runs: string[] = []
 
         await transactEach<Schema, string>(
             context,
             ['first', 'second'],
             async (tx, name) => {
+                runs.push(name)
                 const row = await tx.Rentals.partition('s1').get('r1')
                 await tx.Rentals.partition('s1').update('r1', row.revision, {
                     name,
                     count: row.document.count + 1,
                 })
             },
-            { delay: 1 },
+            { retries: 0 },
         )
 
+        assert.deepStrictEqual(runs, ['first', 'second', 'second'])
         assert.deepStrictEqual(await rentalsOf(context), [{ name: 'second', count: 2 }])
     })
 
