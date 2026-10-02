@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
-import type { ReadOptions, TransactionItem } from './lib/driver.js'
+import type { ReadOptions, TransactionItem, WriteOptions } from './lib/driver.js'
 import { conflict, notFound, transactionTooLarge } from './lib/errors.js'
 import { isoOf } from './lib/expiry.js'
 import { maxTransactionBytes, maxTransactionItems } from './lib/transaction.js'
@@ -57,6 +57,7 @@ type Row = {
 
 class MemoryConnection {
     readonly transactionItemsMax = maxTransactionItems
+    readonly acceptsNewRevision = true
     readonly #documents: MemoryDocuments | DelayedDocuments | LaggingDocuments
     #closed = false
 
@@ -69,7 +70,7 @@ class MemoryConnection {
         partition: string,
         key: string,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         this.#throwIfClosed()
         return await this.#documents.add(table, partition, key, document, options)
@@ -107,7 +108,7 @@ class MemoryConnection {
         key: string,
         currentRevision: unknown,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         this.#throwIfClosed()
         return await this.#documents.update(
@@ -153,20 +154,14 @@ class MemoryDocuments {
         () => new MapWithDefault<string, Map<string, Row>>(() => new Map<string, Row>()),
     )
 
-    add(
-        table: string,
-        partition: string,
-        key: string,
-        document: unknown,
-        options: { now: number; expiresAt?: number },
-    ) {
+    add(table: string, partition: string, key: string, document: unknown, options: WriteOptions) {
         const p = this.#tables.get(table).get(partition)
         const existing = p.get(key)
         if (isLive(existing, options.now)) {
             throw conflict()
         }
         const row = storedRow(
-            randomUUID(),
+            options.newRevision ?? randomUUID(),
             document,
             options.expiresAt,
             nextSeq(existing),
@@ -237,7 +232,7 @@ class MemoryDocuments {
         key: string,
         currentRevision: unknown,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         const p = this.#tables.get(table).get(partition)
         const existing = p.get(key)
@@ -245,7 +240,7 @@ class MemoryDocuments {
             throw conflict()
         }
         const row = storedRow(
-            randomUUID(),
+            options.newRevision ?? randomUUID(),
             document,
             options.expiresAt,
             existing.seq + 1,
@@ -354,7 +349,7 @@ class DelayedDocuments {
         partition: string,
         key: string,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         await using _ = await delayed()
         return this.#inner.add(table, partition, key, document, options)
@@ -394,7 +389,7 @@ class DelayedDocuments {
         key: string,
         currentRevision: unknown,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         await using _ = await delayed()
         return this.#inner.update(table, partition, key, currentRevision, document, options)
@@ -429,13 +424,7 @@ class LaggingDocuments {
         () => new MapWithDefault<string, Map<string, Stale>>(() => new Map<string, Stale>()),
     )
 
-    add(
-        table: string,
-        partition: string,
-        key: string,
-        document: unknown,
-        options: { now: number; expiresAt?: number },
-    ) {
+    add(table: string, partition: string, key: string, document: unknown, options: WriteOptions) {
         this.#remember(table, partition, key)
         return this.#inner.add(table, partition, key, document, options)
     }
@@ -514,7 +503,7 @@ class LaggingDocuments {
         key: string,
         currentRevision: unknown,
         document: unknown,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) {
         this.#remember(table, partition, key)
         return this.#inner.update(table, partition, key, currentRevision, document, options)

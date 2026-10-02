@@ -99,6 +99,42 @@ export function harness(
         ])
     })
 
+    it('stores the revision it is given when it declares that it does', async () => {
+        const { partition, key, document: added } = aRow()
+        await using c = await connect(driver, contextFactory)
+        if (!c.docs.acceptsNewRevision) {
+            return
+        }
+        const addedRevision = anId()
+        const add = await c.docs.add(table, partition, key, added, {
+            now,
+            newRevision: addedRevision,
+        })
+        assert.deepStrictEqual(add, { revision: addedRevision, seq: 0, updatedAt })
+        const updated = aDocument()
+        const updatedRevision = anId()
+        const update = await c.docs.update(table, partition, key, addedRevision, updated, {
+            now,
+            newRevision: updatedRevision,
+        })
+        assert.deepStrictEqual(update, { revision: updatedRevision, seq: 1, updatedAt })
+        assert.deepStrictEqual(await c.docs.get(table, partition, key), {
+            partition,
+            key,
+            revision: updatedRevision,
+            document: updated,
+            seq: 1,
+            updatedAt,
+        })
+        await assert.rejects(
+            c.docs.update(table, partition, key, addedRevision, aDocument(), {
+                now,
+                newRevision: anId(),
+            }),
+            isConflict,
+        )
+    })
+
     it('gets JSON serialized', async () => {
         const time = new Date()
         const { partition, key, document: added } = aRow({ time })

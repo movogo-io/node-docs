@@ -86,6 +86,10 @@ export type TransactionItem =
           key: string
       }
 
+// `newRevision`, when given, is the revision `add` or `update` stores; a
+// driver that declares `acceptsNewRevision` honours it, any other mints its own.
+export type WriteOptions = { now: number; expiresAt?: number; newRevision?: Revision }
+
 // What `add` and `update` stored, as `get` would read it back.
 export type Written = { revision: Revision; seq: number; updatedAt: string }
 
@@ -97,13 +101,20 @@ export type Connection = {
     // the store keeps its own. A decorator forwards both, or hides them.
     readonly requestsInFlightMax?: number
     readonly transactionItemsMax?: number
+    // Whether `add` and `update` store the `newRevision` they are given rather
+    // than one of their own, as a transaction stores an item's. Only then does
+    // the store write a table an extension covers without a transaction, since
+    // the extension was handed the revision before the write. A connection
+    // that declares nothing, or a decorator that hides it, keeps such writes
+    // in a transaction.
+    readonly acceptsNewRevision?: boolean
     close: () => Promise<void>
     add: (
         table: string,
         partition: string,
         key: string,
         document: StoredDocument,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) => Promise<Written>
     get: (
         table: string,
@@ -144,7 +155,7 @@ export type Connection = {
         key: string,
         revision: Revision,
         document: StoredDocument,
-        options: { now: number; expiresAt?: number },
+        options: WriteOptions,
     ) => Promise<Written>
     delete: (
         table: string,

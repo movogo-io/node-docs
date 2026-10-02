@@ -11,6 +11,7 @@ export {
     type ReadOptions,
     type TransactionItem,
     type WriteExtension,
+    type WriteOptions,
     type Written,
 } from './lib/driver.js'
 export { maxTransactionBytes, maxTransactionItems } from './lib/transaction.js'

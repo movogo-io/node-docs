@@ -190,10 +190,12 @@ function transactional(table: string) {
     return hasIndexes(table) || isExtended(table)
 }
 
-// A table written plainly goes through `add`, which answers what it stored. A
-// transaction answers nothing: `seq` and `updatedAt` are then what the driver
-// stores for a write over the row read beforehand, `replaced` when the caller
-// read it, or a read here.
+// A table written plainly goes through `add`, which answers what it stored,
+// and so does a table whose extensions add nothing to the write, when the
+// driver stores the revision the extensions were handed. A transaction answers
+// nothing: `seq` and `updatedAt` are then what the driver stores for a write
+// over the row read beforehand, `replaced` when the caller read it, or a read
+// here.
 export async function addWithIndexes(
     c: Connection,
     context: object,
@@ -217,8 +219,19 @@ export async function addWithIndexes(
         newRevision: randomUUID(),
         ...expiry,
     }
+    const extended = prepareExtensions(context, [item])
+    if (writesPlainly(c, table, extended)) {
+        const written = await c.add(table, partition, key, document, {
+            now,
+            ...expiry,
+            newRevision: item.newRevision,
+        })
+        assertStoredAsHanded(written, item)
+        extended.committed()
+        return written
+    }
     const { entries, seq } = replaced ?? (await replacedByAdd(c, item))
-    await transactOne(c, context, item, item, addIndexItems(item, entries), now)
+    await transactOne(c, item, addIndexItems(item, entries), extended, now)
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -247,9 +260,20 @@ export async function updateWithIndexes(
         newRevision: randomUUID(),
         ...expiry,
     }
+    const extended = prepareExtensions(context, [item])
+    if (writesPlainly(c, table, extended)) {
+        const written = await c.update(table, partition, key, revision, document, {
+            now,
+            ...expiry,
+            newRevision: item.newRevision,
+        })
+        assertStoredAsHanded(written, item)
+        extended.committed()
+        return written
+    }
     const { entries, seq } =
         replaced ?? replacedOf(table, partition, key, await existingRow(c, item, now))
-    await transactOne(c, context, item, item, updateIndexItems(item, entries), now)
+    await transactOne(c, item, updateIndexItems(item, entries), extended, now)
     return { revision: item.newRevision, seq, updatedAt: isoOf(now) }
 }
 
@@ -268,27 +292,43 @@ export async function deleteWithIndexes(
     }
     const item: Delete = { op: 'delete', table, partition, key, revision }
     const { document } = await existingRow(c, item, now)
-    await transactOne(
-        c,
-        context,
-        item,
-        { ...item, document },
-        deleteIndexItems(item, document),
-        now,
-    )
+    const extended = prepareExtensions(context, [{ ...item, document }])
+    // A delete stores no revision, so any driver deletes plainly.
+    if (extended.items.length === 0 && !hasIndexes(table)) {
+        await c.delete(table, partition, key, revision, { now })
+        extended.committed()
+        return
+    }
+    await transactOne(c, item, deleteIndexItems(item, document), extended, now)
+}
+
+// An add or update the extensions add nothing to needs no transaction on a
+// table without indexes, provided the driver stores the revision they were
+// handed.
+function writesPlainly(c: Connection, table: string, extended: Expanded) {
+    return extended.items.length === 0 && !hasIndexes(table) && c.acceptsNewRevision === true
+}
+
+// The extensions were handed `newRevision` before the write; a driver, or a
+// decorator, that declares `acceptsNewRevision` and stores another would have
+// them report a revision that does not exist, so they are not told.
+function assertStoredAsHanded(written: Written, item: Add | Update) {
+    if (written.revision !== item.newRevision) {
+        throw new Error(
+            `A connection declares acceptsNewRevision but stored revision ${String(written.revision)} for ${item.table}, not the ${String(item.newRevision)} it was given.`,
+        )
+    }
 }
 
 // The extensions are told only after the transaction resolved, so they hear
 // of a write exactly when it committed.
 async function transactOne(
     c: Connection,
-    context: object,
     item: TransactionItem,
-    write: ExtendedWrite,
     indexItems: TransactionItem[],
+    extended: Expanded,
     now: number,
 ) {
-    const extended = prepareExtensions(context, [write])
     await c.transact(withinItemLimit(c, [item, ...indexItems, ...extended.items], 1), { now })
     extended.committed()
 }
